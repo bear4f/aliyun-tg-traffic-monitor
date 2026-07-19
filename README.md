@@ -85,16 +85,29 @@ CDT 免费额度分两个池：**非中国内地 200 GB/月**，**中国内地 2
 
 ## 安装
 
+一键安装（升级也用同一条命令，配置自动保留并备份）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/bear4f/aliyun-tg-traffic-monitor/main/install.sh | sudo bash
+```
+
+没有 curl 的系统用 wget：
+
+```bash
+wget -qO- https://raw.githubusercontent.com/bear4f/aliyun-tg-traffic-monitor/main/install.sh | sudo bash
+```
+
+或者传统方式：
+
 ```bash
 git clone https://github.com/bear4f/aliyun-tg-traffic-monitor.git
 cd aliyun-tg-traffic-monitor
-chmod +x install.sh uninstall.sh manage.sh
 sudo ./install.sh
 ```
 
 系统要求：Debian 11+ / Ubuntu / Alpine / Rocky / AlmaLinux，Python 3.9+，root 权限。
 
-首次安装进入向导：Telegram Token → 管理员 User ID → 全局设置 → 逐台添加机器（每台录完自动验活）。
+首次安装进入向导：Telegram Token → 管理员 User ID → 全局设置 → 逐台添加机器（每台录完自动验活）。管道安装时向导会自动接回终端（/dev/tty），交互不受影响。
 
 ## 日常使用
 

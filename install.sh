@@ -3,11 +3,45 @@ set -Eeuo pipefail
 
 APP_DIR=/opt/aliyun-traffic-bot
 SERVICE_NAME=aliyun-traffic-bot
-SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_TARBALL="https://github.com/bear4f/aliyun-tg-traffic-monitor/archive/refs/heads/main.tar.gz"
+# ${BASH_SOURCE[0]} is unset when the script arrives via `curl … | bash`.
+SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo .)"
 
 if [[ ${EUID} -ne 0 ]]; then
   echo "请使用 root 执行。" >&2
   exit 1
+fi
+
+# One-liner bootstrap: when the repo files are not next to this script
+# (curl | bash), download the latest main tarball and re-run from there.
+if [[ ! -f "$SRC_DIR/app.py" || ! -f "$SRC_DIR/common.py" ]]; then
+  echo "未在源码目录中运行，进入一键安装模式：正在下载最新版本……"
+  TMP_DIR="$(mktemp -d)"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$REPO_TARBALL" | tar -xz -C "$TMP_DIR"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO- "$REPO_TARBALL" | tar -xz -C "$TMP_DIR"
+  else
+    echo "需要 curl 或 wget 才能下载仓库。" >&2
+    rm -rf "$TMP_DIR"
+    exit 1
+  fi
+  INNER="$TMP_DIR/aliyun-tg-traffic-monitor-main/install.sh"
+  if [[ ! -f "$INNER" ]]; then
+    echo "下载内容异常，未找到 install.sh。" >&2
+    rm -rf "$TMP_DIR"
+    exit 1
+  fi
+  # Piped stdin is already consumed by bash itself; the first-run wizard is
+  # interactive, so hand the inner script the real terminal when one exists.
+  rc=0
+  if ( : < /dev/tty ) 2>/dev/null; then
+    bash "$INNER" < /dev/tty || rc=$?
+  else
+    bash "$INNER" || rc=$?
+  fi
+  rm -rf "$TMP_DIR"
+  exit "$rc"
 fi
 
 install_packages() {

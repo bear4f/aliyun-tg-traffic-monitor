@@ -1,5 +1,9 @@
 # Changelog
 
+## 3.0.2
+
+- 新增 curl / wget 一键安装：`curl -fsSL …/install.sh | sudo bash`。install.sh 检测到不在源码目录运行时，自动下载最新 main 压缩包并从解压目录重新执行；管道场景下 stdin 已被脚本本身占用，首次配置向导自动改从 /dev/tty 读取，交互不受影响。升级复用同一条命令，配置保留并备份。
+
 ## 3.0.1
 
 ### EIP / 实例安全加固
