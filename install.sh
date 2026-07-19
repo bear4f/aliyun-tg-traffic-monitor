@@ -4,18 +4,27 @@ set -Eeuo pipefail
 APP_DIR=/opt/aliyun-traffic-bot
 SERVICE_NAME=aliyun-traffic-bot
 REPO_TARBALL="https://github.com/bear4f/aliyun-tg-traffic-monitor/archive/refs/heads/main.tar.gz"
+
 # ${BASH_SOURCE[0]} is unset when the script arrives via `curl … | bash`.
-SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo .)"
+# A piped run must ALWAYS download fresh source — the working directory may
+# happen to be a stale checkout, which must never be trusted as the payload.
+PIPED=0
+if [[ -z "${BASH_SOURCE[0]:-}" ]]; then
+  PIPED=1
+  SRC_DIR="$(pwd)"
+else
+  SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo .)"
+fi
 
 if [[ ${EUID} -ne 0 ]]; then
   echo "请使用 root 执行。" >&2
   exit 1
 fi
 
-# One-liner bootstrap: when the repo files are not next to this script
-# (curl | bash), download the latest main tarball and re-run from there.
-if [[ ! -f "$SRC_DIR/app.py" || ! -f "$SRC_DIR/common.py" ]]; then
-  echo "未在源码目录中运行，进入一键安装模式：正在下载最新版本……"
+# One-liner bootstrap: piped runs, or a lone install.sh without the repo
+# beside it, fetch the latest main tarball and re-run from there.
+if [[ ${PIPED} -eq 1 || ! -f "$SRC_DIR/app.py" || ! -f "$SRC_DIR/common.py" ]]; then
+  echo "一键安装模式：正在下载最新版本……"
   TMP_DIR="$(mktemp -d)"
   if command -v curl >/dev/null 2>&1; then
     curl -fsSL "$REPO_TARBALL" | tar -xz -C "$TMP_DIR"
@@ -114,7 +123,7 @@ systemctl enable --now "$SERVICE_NAME"
 
 cat <<EOF
 
-安装/升级完成。
+安装/升级完成，当前版本 $(cat "$SRC_DIR/VERSION" 2>/dev/null || echo 未知)。
 
   交互面板：aliyun-monitor
   一键自检：aliyun-monitor doctor
