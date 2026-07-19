@@ -30,7 +30,7 @@ LOG_PATH = Path(os.environ.get("ALIYUN_MONITOR_LOG", APP_DIR / "monitor.log"))
 SERVICE_NAME = "aliyun-traffic-bot"
 GIB = 1024 ** 3
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,24}$")
-VERSION = "3.0.4"
+VERSION = "3.1.0"
 
 PROVIDERS = {
     "ecs_cdt": "ECS / CDT",
@@ -490,8 +490,12 @@ class AliyunClient:
                 req.set_domain(domain)
                 req.set_version(version)
                 req.set_action_name(action)
-                req.set_connect_timeout(5000)
-                req.set_read_timeout(15000)
+                # SDK timeouts are in SECONDS (passed straight through to
+                # requests). The widely-copied 5000/15000 "milliseconds"
+                # actually meant 83 minutes / 4 hours and could hang a worker
+                # thread — and with it the whole update queue — for ages.
+                req.set_connect_timeout(5)
+                req.set_read_timeout(15)
                 for key, value in (params or {}).items():
                     req.add_query_param(key, value)
                 raw = client.do_action_with_exception(req)

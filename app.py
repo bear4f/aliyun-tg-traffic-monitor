@@ -348,7 +348,7 @@ class MonitorService:
         start = page * page_size
         return page, total_pages, enabled[start : start + page_size]
 
-    def home_text(self, page: int = 0, title: str = "📊 阿里云流量监控") -> str:
+    def home_text(self, page: int = 0, title: str = "📊 阿里云流量监控", notice: str = "") -> str:
         page, total_pages, items = self.page_instances(page)
         now = self.now()
         _, days_left = month_reset_info(now)
@@ -359,6 +359,8 @@ class MonitorService:
             f"<b>{title}</b>",
             f"账期 {now.strftime('%Y-%m')} · {days_left} 天后重置 · 更新于 {freshness}",
         ]
+        if notice:
+            header.append(notice)
         if total_pages > 1:
             header.append(f"第 {page + 1}/{total_pages} 页")
 
@@ -374,11 +376,11 @@ class MonitorService:
             footer = f"\n\n⏸️ <i>已停用：{names}</i>"
         return "\n".join(header) + "\n\n" + "\n\n".join(blocks) + footer
 
-    def instance_text(self, inst: Dict[str, Any]) -> str:
+    def instance_text(self, inst: Dict[str, Any], notice: str = "") -> str:
         name = html.escape(inst["name"])
         snap = self.last_snapshots.get(inst["id"])
         lines = [
-            f"🖥️ <b>{name}</b>",
+            f"🖥️ <b>{name}</b>" + (f"\n{notice}" if notice else ""),
             f"类型：{PROVIDERS[inst['provider']]} · 地域 <code>{html.escape(inst['region'])}</code>",
             f"实例：<code>{html.escape(inst['instance_id'])}</code>",
             "🔒 停机保留公网 IP（KeepCharging，不可更改）",
@@ -628,12 +630,14 @@ async def safe_edit(query, text: str, markup: Optional[InlineKeyboardMarkup]) ->
             raise
 
 
-async def render_home(service: MonitorService, query, page: int = 0) -> None:
-    await safe_edit(query, service.home_text(page), service.home_keyboard(page))
+async def render_home(service: MonitorService, query, page: int = 0, notice: str = "") -> None:
+    await safe_edit(query, service.home_text(page, notice=notice), service.home_keyboard(page))
 
 
-async def render_instance(service: MonitorService, query, inst: Dict[str, Any]) -> None:
-    await safe_edit(query, service.instance_text(inst), service.instance_keyboard(inst))
+async def render_instance(
+    service: MonitorService, query, inst: Dict[str, Any], notice: str = ""
+) -> None:
+    await safe_edit(query, service.instance_text(inst, notice=notice), service.instance_keyboard(inst))
 
 
 # --------------------------------------------------------------------------
@@ -850,15 +854,30 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.answer("🔄 正在查询……")
         if parts[1] == "a":
             page = int(parts[2]) if len(parts) > 2 else 0
+            # Flip the message into a working state immediately so the press
+            # is visibly acknowledged before the (slow) API round-trips.
+            await safe_edit(
+                query,
+                f"⏳ <b>正在查询 {len(service.enabled_instances())} 台机器……</b>\n"
+                f"<i>完成后本条消息会自动刷新，无需重复点击。</i>",
+                None,
+            )
             await service.check_once(context.application, enforce=True)
-            await render_home(service, query, page)
+            await render_home(
+                service, query, page, notice=f"✅ 已刷新 · {service.now():%H:%M:%S}"
+            )
         else:
             inst = service.config.get_instance(parts[2])
             if not inst:
                 await render_home(service, query, 0)
                 return
+            await safe_edit(
+                query, f"⏳ <b>正在查询 {html.escape(inst['name'])}……</b>", None
+            )
             await service.api_snapshot(inst)
-            await render_instance(service, query, inst)
+            await render_instance(
+                service, query, inst, notice=f"✅ 已刷新 · {service.now():%H:%M:%S}"
+            )
         return
 
     # -- global settings ---------------------------------------------------
@@ -972,10 +991,11 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if not inst.get("allow_manual_control", True):
             await query.answer("该实例已禁用手动控制。", show_alert=True)
             return
+        await query.answer(f"正在{ACTION_CN[action]}……")
         if action == "start" and inst.get("auto_shutdown", True):
+            await safe_edit(query, "⏳ <b>正在核对当前流量……</b>", None)
             snap = await service.api_snapshot(inst)
             if not snap.error and snap.percent >= int(inst.get("shutdown_percent", 95)):
-                await query.answer("流量仍高于熔断阈值。", show_alert=True)
                 await safe_edit(
                     query,
                     f"🚫 <b>{html.escape(inst['name'])}</b> 当前流量 {snap.percent:.1f}%，"
@@ -984,12 +1004,16 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     service.instance_keyboard(inst),
                 )
                 return
-        await query.answer(f"正在{ACTION_CN[action]}……")
+        await safe_edit(
+            query,
+            f"⏳ <b>正在向阿里云发送{ACTION_CN[action]}指令……</b>",
+            None,
+        )
         try:
             await service.api_control(inst, action)
-            note = f"✅ 已向阿里云发送 <b>{ACTION_CN[action]}</b> 指令。\n<i>状态需要几十秒才会更新，稍后点刷新。</i>"
+            note = f"✅ 已发送 <b>{ACTION_CN[action]}</b> 指令 · {service.now():%H:%M:%S}\n<i>实例状态需要几十秒才会变化，稍后点刷新确认。</i>"
         except Exception as exc:
-            note = f"❌ 操作失败\n<code>{html.escape(str(exc)[:500])}</code>"
+            note = f"❌ 操作失败 · {service.now():%H:%M:%S}\n<code>{html.escape(str(exc)[:500])}</code>"
         await safe_edit(query, service.instance_text(inst) + "\n\n" + note, service.instance_keyboard(inst))
         return
 
@@ -1024,7 +1048,15 @@ def main() -> None:
         raise SystemExit(2) from exc
 
     service = MonitorService(config, state)
-    app = ApplicationBuilder().token(config.telegram["bot_token"]).post_init(post_init).build()
+    # concurrent_updates: one slow handler (e.g. a refresh waiting on the
+    # Aliyun API) must never freeze every other button press in the queue.
+    app = (
+        ApplicationBuilder()
+        .token(config.telegram["bot_token"])
+        .concurrent_updates(True)
+        .post_init(post_init)
+        .build()
+    )
     app.bot_data["service"] = service
     app.add_handler(CommandHandler(["start", "menu"], command_menu))
     app.add_handler(CommandHandler("status", command_status))
