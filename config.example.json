@@ -1,0 +1,59 @@
+{
+  "telegram": {
+    "bot_token": "123456789:REPLACE_ME",
+    "admin_user_ids": [
+      123456789
+    ],
+    "notify_chat_id": 123456789
+  },
+  "monitor": {
+    "interval_seconds": 300,
+    "warning_percentages": [
+      80,
+      90,
+      95
+    ],
+    "daily_report_time": "09:00",
+    "timezone": "Asia/Taipei",
+    "error_notify_cooldown_seconds": 3600,
+    "resume_below_percent": 10,
+    "max_concurrency": 5,
+    "telegram_page_size": 6
+  },
+  "instances": [
+    {
+      "id": "hk1",
+      "name": "Aliyun HK-1",
+      "provider": "ecs_cdt",
+      "region": "cn-hongkong",
+      "instance_id": "i-REPLACE_ME",
+      "access_key_id": "REPLACE_RAM_ACCESS_KEY_ID",
+      "access_key_secret": "REPLACE_RAM_ACCESS_KEY_SECRET",
+      "quota_gb": 200,
+      "traffic_scope": "overseas",
+      "enabled": true,
+      "auto_shutdown": true,
+      "shutdown_percent": 90,
+      "auto_start_next_month": false,
+      "allow_manual_control": true,
+      "stopped_mode": "KeepCharging"
+    },
+    {
+      "id": "sg1",
+      "name": "Aliyun SG-1",
+      "provider": "ecs_cdt",
+      "region": "ap-southeast-1",
+      "instance_id": "i-REPLACE_ME_TOO",
+      "access_key_id": "REPLACE_SECOND_ACCOUNT_KEY_ID",
+      "access_key_secret": "REPLACE_SECOND_ACCOUNT_KEY_SECRET",
+      "quota_gb": 200,
+      "traffic_scope": "overseas",
+      "enabled": true,
+      "auto_shutdown": true,
+      "shutdown_percent": 90,
+      "auto_start_next_month": false,
+      "allow_manual_control": true,
+      "stopped_mode": "KeepCharging"
+    }
+  ]
+}

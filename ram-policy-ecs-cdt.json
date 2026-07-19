@@ -1,0 +1,28 @@
+{
+  "Version": "1",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "cdt:ListCdtInternetTraffic",
+        "ecs:DescribeInstances",
+        "ecs:StartInstance",
+        "ecs:StopInstance",
+        "ecs:RebootInstance"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Deny",
+      "Action": [
+        "ecs:DeleteInstance",
+        "ecs:DeleteInstances",
+        "ecs:ModifyInstanceChargeType",
+        "vpc:ReleaseEipAddress",
+        "vpc:UnassociateEipAddress",
+        "vpc:DeleteEipAddress"
+      ],
+      "Resource": "*"
+    }
+  ]
+}

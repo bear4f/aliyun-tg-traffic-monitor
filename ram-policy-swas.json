@@ -1,0 +1,27 @@
+{
+  "Version": "1",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "swas-open:ListInstancesTrafficPackages",
+        "swas-open:ListInstanceStatus",
+        "swas-open:StartInstance",
+        "swas-open:StopInstance",
+        "swas-open:RebootInstance"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Deny",
+      "Action": [
+        "ecs:DeleteInstance",
+        "ecs:DeleteInstances",
+        "vpc:ReleaseEipAddress",
+        "vpc:UnassociateEipAddress",
+        "vpc:DeleteEipAddress"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
