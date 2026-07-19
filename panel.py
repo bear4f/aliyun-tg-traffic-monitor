@@ -104,13 +104,25 @@ def atomic_save(data: Dict[str, Any]) -> None:
 def ask(prompt: str, default: Optional[str] = None, *, secret: bool = False, allow_empty: bool = False) -> str:
     suffix = dim(f" [{default}]") if default not in (None, "") else ""
     while True:
-        raw = getpass.getpass(f"{prompt}{suffix}: ") if secret else input(f"{prompt}{suffix}: ")
+        try:
+            raw = getpass.getpass(f"{prompt}{suffix}: ") if secret else input(f"{prompt}{suffix}: ")
+        except EOFError:
+            # Ctrl+D or a closed stdin must cancel cleanly, not traceback.
+            print(bad("\n输入流已结束，操作取消。"))
+            raise KeyboardInterrupt from None
         value = raw.strip()
         if not value and default is not None:
             return str(default)
         if value or allow_empty:
             return value
         print(bad("该项不能为空。"))
+
+
+def parse_id_list(raw: str) -> List[int]:
+    """Parse comma-separated Telegram IDs, tolerating full-width commas and
+    stray spaces from mobile keyboards."""
+    normalized = raw.replace("，", ",").replace("；", ",").replace(";", ",")
+    return list(dict.fromkeys(int(x.strip()) for x in normalized.split(",") if x.strip()))
 
 
 def ask_bool(prompt: str, default: bool) -> bool:
@@ -404,6 +416,55 @@ def verify_bot_token(token: str) -> Optional[str]:
     return None
 
 
+def fetch_updates_user_ids(token: str) -> List[tuple]:
+    """Return [(user_id, display_name)] of everyone who has messaged the bot.
+
+    Used during first-run setup, when the bot service is not running yet and
+    /id therefore cannot answer — the wizard reads pending updates directly.
+    """
+    try:
+        with urllib.request.urlopen(
+            f"https://api.telegram.org/bot{token}/getUpdates?timeout=0&limit=100", timeout=15
+        ) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError, json.JSONDecodeError):
+        return []
+    if not payload.get("ok"):
+        return []
+    seen: Dict[int, str] = {}
+    for update in payload.get("result", []):
+        message = update.get("message") or update.get("edited_message") or {}
+        sender = message.get("from") or {}
+        uid = sender.get("id")
+        if not isinstance(uid, int):
+            continue
+        name = " ".join(x for x in (sender.get("first_name"), sender.get("last_name")) if x)
+        if sender.get("username"):
+            name = (name + f" @{sender['username']}").strip()
+        seen[uid] = name or str(uid)
+    return list(seen.items())
+
+
+def autodetect_admin_ids(token: str, username: str) -> str:
+    """Interactive loop: user messages the bot, we read the IDs back.
+    Returns a comma-joined ID string, or '' when detection was skipped."""
+    print()
+    print(warn("  Bot 服务此时尚未运行，向它发送 /id 不会有任何回复。"))
+    print(f"  请打开 Telegram，向 {bold('@' + username)} 随便发送一条消息（例如 hello）。")
+    while True:
+        ask("发送完成后按回车，自动读取你的 User ID", "", allow_empty=True)
+        detected = fetch_updates_user_ids(token)
+        if detected:
+            print(ok("  检测到以下用户："))
+            for uid, display in detected:
+                print(f"    · {bold(str(uid))}  {display}")
+            return ",".join(str(uid) for uid, _ in detected)
+        print(warn("  尚未收到任何消息。请确认发送对象是这个 Bot，稍等两秒再试。"))
+        if not ask_bool("再试一次自动读取", True):
+            print(dim("  也可以向 @userinfobot 发送任意消息查到自己的数字 ID，再手动输入。"))
+            return ""
+
+
 def configure_telegram(data: Dict[str, Any], first_run: bool = False) -> None:
     tg = data.setdefault("telegram", {})
     rule("Telegram 配置")
@@ -421,17 +482,20 @@ def configure_telegram(data: Dict[str, Any], first_run: bool = False) -> None:
         print(f"  {warn('•')} 无法验证 Token（可能是网络不通或 Token 有误）")
 
     existing = ",".join(str(x) for x in tg.get("admin_user_ids", []) if str(x).strip())
-    print(dim("  向你的 Bot 发送 /id 即可获得 User ID。"))
+    if not existing and username:
+        existing = autodetect_admin_ids(str(tg["bot_token"]), username)
+    elif existing:
+        print(dim("  服务运行期间，向 Bot 发送 /id 可查看 User ID。"))
     while True:
-        raw = ask("管理员 Telegram User ID（多个用逗号分隔）", existing or None)
+        raw = ask("管理员 Telegram User ID（多个用逗号分隔，回车确认）", existing or None)
         try:
-            admins = list(dict.fromkeys(int(x.strip()) for x in raw.split(",") if x.strip()))
+            admins = parse_id_list(raw)
             if not admins:
                 raise ValueError
             tg["admin_user_ids"] = admins
             break
         except ValueError:
-            print(bad("User ID 必须是整数，多个 ID 用英文逗号分隔。"))
+            print(bad("User ID 必须是数字，多个 ID 用逗号分隔（如 123456789）。"))
 
     while True:
         try:
