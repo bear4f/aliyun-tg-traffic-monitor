@@ -16,6 +16,7 @@
     "daily_report_time": "09:00",
     "timezone": "Asia/Taipei",
     "error_notify_cooldown_seconds": 3600,
+    "error_notify_after_failures": 3,
     "resume_below_percent": 10,
     "max_concurrency": 5,
     "telegram_page_size": 6

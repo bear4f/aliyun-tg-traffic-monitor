@@ -176,9 +176,9 @@ class MonitorService:
 
     # -- monitoring --------------------------------------------------------
 
-    async def send_notify(self, app: Application, text: str) -> None:
+    async def send_notify(self, app: Application, text: str):
         try:
-            await app.bot.send_message(
+            return await app.bot.send_message(
                 chat_id=self.config.telegram["notify_chat_id"],
                 text=text,
                 parse_mode=ParseMode.HTML,
@@ -186,6 +186,7 @@ class MonitorService:
             )
         except Exception as exc:
             self.log.error("Telegram 通知失败: %s", exc)
+            return None
 
     async def _handle_month_change(self, app: Application, current_month: str) -> None:
         old_month = self.state.data.get("month", "")
@@ -226,39 +227,45 @@ class MonitorService:
                 st = self.state.instance(inst["id"])
 
                 if snap.error:
+                    # A lone blip (or anything under the threshold) stays off
+                    # the notification channel entirely — the panel card shows
+                    # the streak, and it clears itself on recovery.
+                    streak = int(st.get("error_streak", 1) or 1)
+                    threshold = int(self.config.monitor["error_notify_after_failures"])
                     cooldown = int(self.config.monitor["error_notify_cooldown_seconds"])
-                    if time.time() - float(st.get("last_error_notify", 0)) >= cooldown:
-                        streak = int(st.get("error_streak", 1) or 1)
+                    if (
+                        streak >= threshold
+                        and time.time() - float(st.get("last_error_notify", 0)) >= cooldown
+                    ):
                         since = float(st.get("error_since", 0) or 0)
-                        detail = (
-                            f"（已连续失败 {streak} 次，自 {self.fmt_time(since)} 起）"
-                            if streak > 1 and since
-                            else ""
-                        )
-                        await self.send_notify(
+                        msg = await self.send_notify(
                             app,
-                            f"⚠️ <b>{html.escape(inst['name'])} 查询失败</b>{detail}\n"
+                            f"⚠️ <b>{html.escape(inst['name'])} 持续查询失败</b>\n"
+                            f"已连续失败 {streak} 次（自 {self.fmt_time(since or time.time())} 起）\n"
                             f"<code>{html.escape(snap.error[:800])}</code>\n\n"
-                            f"查询失败期间不会执行自动关机，面板继续显示上次成功数据。"
-                            f"若持续失败，最多每 {self.fmt_interval(cooldown)}提醒一次；"
-                            f"恢复后会另行通知。",
+                            f"查询失败期间不会执行自动关机，面板继续显示上次成功数据；"
+                            f"恢复后本条通知会自动撤回。",
                         )
+                        if msg:
+                            st.setdefault("error_notify_msgs", []).append(
+                                {"chat_id": msg.chat_id, "message_id": msg.message_id}
+                            )
                         st["last_error_notify"] = time.time()
                         st["error_notified"] = True
                     self.state.save()
                     continue
 
-                recovered = st.pop("recovered", None)
-                if recovered and recovered.get("notified"):
-                    since = float(recovered.get("since", 0) or 0)
-                    ended = float(recovered.get("at", time.time()))
-                    minutes = max(1, int((ended - since) / 60)) if since else 1
-                    await self.send_notify(
-                        app,
-                        f"✅ <b>{html.escape(inst['name'])} 查询已恢复</b>\n"
-                        f"期间连续失败 {recovered.get('streak', 1)} 次，"
-                        f"持续约 {minutes} 分钟。监控与自动熔断已恢复正常。",
-                    )
+                if st.pop("recovered", None) is not None:
+                    # Recovery is silent: retract the failure notices we sent
+                    # (if any) and let the panel going back to normal tell the
+                    # rest of the story.
+                    for ref in st.pop("error_notify_msgs", []) or []:
+                        try:
+                            await app.bot.delete_message(
+                                chat_id=ref["chat_id"], message_id=ref["message_id"]
+                            )
+                        except Exception as exc:
+                            self.log.info("撤回失败通知未成功（可能已超时或被删）: %s", exc)
 
                 if st.get("pending_auto_start"):
                     resume_below = float(self.config.monitor["resume_below_percent"])
@@ -562,6 +569,7 @@ class MonitorService:
                 "🛠️ <b>全局设置</b>",
                 "",
                 f"检查间隔：<b>{m['interval_seconds']} 秒</b>",
+                f"失败通知：连续 <b>{m['error_notify_after_failures']}</b> 次失败才提醒，恢复自动撤回",
                 f"分级提醒线：<b>{'/'.join(str(x) for x in m['warning_percentages'])}%</b>",
                 f"每日汇总时间：<b>{html.escape(str(daily))}</b>",
                 f"时区：<code>{html.escape(str(m['timezone']))}</code>",

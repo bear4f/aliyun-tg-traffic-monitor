@@ -30,7 +30,7 @@ LOG_PATH = Path(os.environ.get("ALIYUN_MONITOR_LOG", APP_DIR / "monitor.log"))
 SERVICE_NAME = "aliyun-traffic-bot"
 GIB = 1024 ** 3
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,24}$")
-VERSION = "3.1.2"
+VERSION = "3.1.3"
 
 PROVIDERS = {
     "ecs_cdt": "ECS / CDT",
@@ -254,6 +254,7 @@ def default_config() -> Dict[str, Any]:
             "daily_report_time": "09:00",
             "timezone": "Asia/Taipei",
             "error_notify_cooldown_seconds": 3600,
+            "error_notify_after_failures": 3,
             "resume_below_percent": 10,
             "max_concurrency": 5,
             "telegram_page_size": 6,
@@ -310,6 +311,9 @@ class ConfigStore:
             monitor["max_concurrency"] = min(20, max(1, int(monitor["max_concurrency"])))
             monitor["telegram_page_size"] = min(15, max(3, int(monitor["telegram_page_size"])))
             monitor["resume_below_percent"] = min(50, max(0, int(monitor["resume_below_percent"])))
+            monitor["error_notify_after_failures"] = min(
+                50, max(1, int(monitor["error_notify_after_failures"]))
+            )
             ZoneInfo(str(monitor["timezone"]))
         except Exception as exc:
             raise ConfigError(f"monitor 配置无效: {exc}") from exc
