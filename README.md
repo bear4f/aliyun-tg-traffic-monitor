@@ -17,7 +17,8 @@ Monitor Aliyun CDT / SWAS monthly traffic from a Telegram bot, with automatic sh
 
 ```text
 📊 阿里云流量监控
-账期 2026-07 · 11 天后重置 · 更新于 2026-07-20 08:20
+账期 2026-07 · 11 天后重置
+🛰️ 每 5 分钟自动检查 · 数据更新于 2026-07-20 08:20
 
 🟢 Aliyun HK-1 · 运行中
 █████████░░░ 79.2%

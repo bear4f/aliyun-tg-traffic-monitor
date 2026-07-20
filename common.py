@@ -30,7 +30,7 @@ LOG_PATH = Path(os.environ.get("ALIYUN_MONITOR_LOG", APP_DIR / "monitor.log"))
 SERVICE_NAME = "aliyun-traffic-bot"
 GIB = 1024 ** 3
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,24}$")
-VERSION = "3.1.1"
+VERSION = "3.1.2"
 
 PROVIDERS = {
     "ecs_cdt": "ECS / CDT",

@@ -99,6 +99,17 @@ class MonitorService:
     def fmt_time(self, ts: float) -> str:
         return datetime.fromtimestamp(ts, self.tz).strftime("%Y-%m-%d %H:%M")
 
+    def fmt_clock(self, ts: float) -> str:
+        return datetime.fromtimestamp(ts, self.tz).strftime("%H:%M")
+
+    def fmt_interval(self, seconds: int) -> str:
+        seconds = int(seconds)
+        if seconds % 3600 == 0:
+            return f"{seconds // 3600} 小时"
+        if seconds % 60 == 0:
+            return f"{seconds // 60} 分钟"
+        return f"{seconds} 秒"
+
     def enabled_instances(self) -> List[Dict[str, Any]]:
         return [x for x in self.config.instances if x.get("enabled", True)]
 
@@ -116,10 +127,20 @@ class MonitorService:
     # -- API wrappers ------------------------------------------------------
 
     async def api_snapshot(self, inst: Dict[str, Any]) -> UsageSnapshot:
+        st = self.state.instance(inst["id"])
         try:
             snap = await asyncio.to_thread(AliyunClient(inst).get_snapshot)
         except Exception as exc:
-            snap = UsageSnapshot(
+            # A failure must not wipe the last good reading off the panels:
+            # record the error stream beside it instead of overwriting it.
+            streak = int(st.get("error_streak", 0) or 0) + 1
+            st["error_streak"] = streak
+            if streak == 1:
+                st["error_since"] = time.time()
+            st["last_error"] = str(exc)
+            st["last_error_at"] = time.time()
+            self.state.save()
+            return UsageSnapshot(
                 instance_key=inst["id"],
                 name=inst["name"],
                 provider=inst["provider"],
@@ -130,8 +151,23 @@ class MonitorService:
                 checked_at=time.time(),
                 error=str(exc),
             )
+        if int(st.get("error_streak", 0) or 0) > 0:
+            # Hand the closed error stream to check_once so it can announce
+            # the recovery even when this success came from a manual refresh.
+            st["recovered"] = {
+                "streak": int(st.get("error_streak", 0) or 0),
+                "since": float(st.get("error_since", 0) or 0),
+                "at": time.time(),
+                "notified": bool(st.get("error_notified")),
+            }
+        st["error_streak"] = 0
+        st["error_since"] = 0
+        st["last_error"] = ""
+        st["last_error_at"] = 0
+        st["error_notified"] = False
+        st["last_error_notify"] = 0
         self.last_snapshots[inst["id"]] = snap
-        self.state.instance(inst["id"])["last_snapshot"] = snap.to_state()
+        st["last_snapshot"] = snap.to_state()
         self.state.save()
         return snap
 
@@ -192,15 +228,37 @@ class MonitorService:
                 if snap.error:
                     cooldown = int(self.config.monitor["error_notify_cooldown_seconds"])
                     if time.time() - float(st.get("last_error_notify", 0)) >= cooldown:
+                        streak = int(st.get("error_streak", 1) or 1)
+                        since = float(st.get("error_since", 0) or 0)
+                        detail = (
+                            f"（已连续失败 {streak} 次，自 {self.fmt_time(since)} 起）"
+                            if streak > 1 and since
+                            else ""
+                        )
                         await self.send_notify(
                             app,
-                            f"⚠️ <b>{html.escape(inst['name'])} 查询失败</b>\n"
+                            f"⚠️ <b>{html.escape(inst['name'])} 查询失败</b>{detail}\n"
                             f"<code>{html.escape(snap.error[:800])}</code>\n\n"
-                            f"查询失败期间不会执行自动关机。",
+                            f"查询失败期间不会执行自动关机，面板继续显示上次成功数据。"
+                            f"若持续失败，最多每 {self.fmt_interval(cooldown)}提醒一次；"
+                            f"恢复后会另行通知。",
                         )
                         st["last_error_notify"] = time.time()
+                        st["error_notified"] = True
                     self.state.save()
                     continue
+
+                recovered = st.pop("recovered", None)
+                if recovered and recovered.get("notified"):
+                    since = float(recovered.get("since", 0) or 0)
+                    ended = float(recovered.get("at", time.time()))
+                    minutes = max(1, int((ended - since) / 60)) if since else 1
+                    await self.send_notify(
+                        app,
+                        f"✅ <b>{html.escape(inst['name'])} 查询已恢复</b>\n"
+                        f"期间连续失败 {recovered.get('streak', 1)} 次，"
+                        f"持续约 {minutes} 分钟。监控与自动熔断已恢复正常。",
+                    )
 
                 if st.get("pending_auto_start"):
                     resume_below = float(self.config.monitor["resume_below_percent"])
@@ -259,11 +317,52 @@ class MonitorService:
             try:
                 snapshots = await self.check_once(app, enforce=True)
                 await self.maybe_daily_report(app, snapshots)
+                await self.update_panel(app)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 self.log.exception("监控循环异常")
             await asyncio.sleep(int(self.config.monitor["interval_seconds"]))
+
+    # -- live panel --------------------------------------------------------
+
+    def register_panel(self, chat_id: int, message_id: int, view: str, page: int = 0) -> None:
+        """Remember which message the user is looking at and which screen it
+        shows. The monitor loop only redraws it while it shows the home view,
+        so a background refresh never yanks the user out of a submenu or an
+        input prompt."""
+        self.state.data["panel"] = {
+            "chat_id": int(chat_id),
+            "message_id": int(message_id),
+            "view": view,
+            "page": int(page),
+        }
+        self.state.save()
+
+    async def update_panel(self, app: Application) -> None:
+        panel = self.state.data.get("panel") or {}
+        if panel.get("view") != "home" or not panel.get("message_id"):
+            return
+        page = int(panel.get("page", 0))
+        try:
+            await app.bot.edit_message_text(
+                chat_id=panel["chat_id"],
+                message_id=panel["message_id"],
+                text=self.home_text(page),
+                parse_mode=ParseMode.HTML,
+                reply_markup=self.home_keyboard(page),
+                disable_web_page_preview=True,
+            )
+        except BadRequest as exc:
+            if "not modified" in str(exc).lower():
+                return
+            # Message deleted, or older than Telegram's ~48h edit window:
+            # unbind and wait for the next /menu to re-register a panel.
+            self.state.data.pop("panel", None)
+            self.state.save()
+            self.log.info("面板自动刷新解绑（%s），等待下次 /menu", exc)
+        except Exception as exc:
+            self.log.warning("面板自动刷新失败: %s", exc)
 
     async def maybe_daily_report(self, app: Application, snapshots: List[UsageSnapshot]) -> None:
         daily_time = str(self.config.monitor.get("daily_report_time", "")).strip()
@@ -317,16 +416,26 @@ class MonitorService:
         """One expanded machine card for the home panel."""
         name = html.escape(inst["name"])
         snap = self.last_snapshots.get(inst["id"])
-        if snap is None:
+        st = self.state.instance(inst["id"])
+        streak = int(st.get("error_streak", 0) or 0)
+        if snap is None or snap.error:
+            # No good reading to fall back on (legacy state files may still
+            # carry an error snapshot here).
+            err = str(st.get("last_error") or (snap.error if snap else "") or "")
+            if streak or err:
+                extra = (
+                    f"（连续 {streak} 次，最近 {self.fmt_clock(float(st.get('last_error_at', 0)))}）"
+                    if streak
+                    else ""
+                )
+                return (
+                    f"⚠️ <b>{name}</b> · 查询失败{extra}\n"
+                    f"<code>{html.escape(err[:160])}</code>"
+                )
             return f"⚪ <b>{name}</b>\n<i>尚未查询，点击「刷新全部」</i>"
-        if snap.error:
-            return (
-                f"⚠️ <b>{name}</b> · 查询失败\n"
-                f"<code>{html.escape(snap.error[:160])}</code>"
-            )
         threshold = int(inst.get("shutdown_percent", 95))
         shield = "开" if inst.get("auto_shutdown", True) else "关"
-        if self.state.instance(inst["id"]).get("shutdown_triggered"):
+        if st.get("shutdown_triggered"):
             shield += "（本账期已触发🛑）"
         resume = "开" if inst.get("auto_start_next_month") else "关"
         line = (
@@ -340,6 +449,11 @@ class MonitorService:
             line += f"\n{pace}"
         if snap.overflow_bytes > 0:
             line += f"\n❗ 已超额 {fmt_gb(snap.overflow_bytes)}"
+        if streak:
+            line += (
+                f"\n⚠️ 查询失败中（连续 {streak} 次，最近 "
+                f"{self.fmt_clock(float(st.get('last_error_at', 0)))}），以上为上次成功数据"
+            )
         return line
 
     def page_instances(self, page: int) -> Tuple[int, int, List[Dict[str, Any]]]:
@@ -356,10 +470,22 @@ class MonitorService:
         _, days_left = month_reset_info(now)
         checked = [s.checked_at for s in self.last_snapshots.values() if s.checked_at]
         freshness = self.fmt_time(max(checked)) if checked else "尚未查询"
+        failing = sum(
+            1
+            for inst in self.enabled_instances()
+            if int(self.state.instance(inst["id"]).get("error_streak", 0) or 0) > 0
+        )
+        watch = (
+            f"🛰️ 每 {self.fmt_interval(int(self.config.monitor['interval_seconds']))}自动检查"
+            f" · 数据更新于 {freshness}"
+        )
+        if failing:
+            watch += f" · ⚠️ {failing} 台查询异常"
 
         header = [
             f"<b>{title}</b>",
-            f"账期 {now.strftime('%Y-%m')} · {days_left} 天后重置 · 更新于 {freshness}",
+            f"账期 {now.strftime('%Y-%m')} · {days_left} 天后重置",
+            watch,
         ]
         if notice:
             header.append(notice)
@@ -388,11 +514,10 @@ class MonitorService:
             "🔒 停机保留公网 IP（KeepCharging，不可更改）",
             "",
         ]
-        if snap is None:
-            lines.append("<i>尚未查询，点击「🔄 刷新」</i>")
-        elif snap.error:
-            lines.append(f"⚠️ 查询失败\n<code>{html.escape(snap.error[:500])}</code>")
-        else:
+        st = self.state.instance(inst["id"])
+        streak = int(st.get("error_streak", 0) or 0)
+        good = snap is not None and not snap.error
+        if good:
             lines += [
                 f"状态：{status_icon(snap.status)} <b>{html.escape(status_cn(snap.status))}</b>",
                 f"<code>{progress_bar(snap.percent, 16)}</code> <b>{snap.percent:.1f}%</b>",
@@ -402,7 +527,7 @@ class MonitorService:
             pace = self.pace_line(inst, snap)
             if pace:
                 lines.append(pace)
-            if self.state.instance(inst["id"]).get("shutdown_triggered"):
+            if st.get("shutdown_triggered"):
                 lines.append("🛑 本账期已触发过自动熔断（新账期自动解除）")
             if snap.overflow_bytes > 0:
                 lines.append(f"❗ 已超额：<b>{fmt_gb(snap.overflow_bytes)}</b>")
@@ -411,6 +536,22 @@ class MonitorService:
                 f"<i>{html.escape(snap.scope_note)}</i>",
                 f"<i>更新于 {self.fmt_time(snap.checked_at)}</i>",
             ]
+        if streak or (snap is not None and snap.error):
+            err = str(st.get("last_error") or (snap.error if snap else "") or "")
+            when = (
+                f"（连续 {streak} 次，最近 {self.fmt_clock(float(st.get('last_error_at', 0)))}）"
+                if streak
+                else ""
+            )
+            lines += [
+                "",
+                f"⚠️ <b>查询失败中</b>{when}",
+                f"<code>{html.escape(err[:500])}</code>",
+            ]
+            if good:
+                lines.append("<i>上方用量为最后一次成功查询的数据。</i>")
+        elif snap is None:
+            lines.append("<i>尚未查询，点击「🔄 刷新」</i>")
         return "\n".join(lines)
 
     def global_text(self) -> str:
@@ -633,12 +774,14 @@ async def safe_edit(query, text: str, markup: Optional[InlineKeyboardMarkup]) ->
 
 
 async def render_home(service: MonitorService, query, page: int = 0, notice: str = "") -> None:
+    service.register_panel(query.message.chat_id, query.message.message_id, "home", page)
     await safe_edit(query, service.home_text(page, notice=notice), service.home_keyboard(page))
 
 
 async def render_instance(
     service: MonitorService, query, inst: Dict[str, Any], notice: str = ""
 ) -> None:
+    service.register_panel(query.message.chat_id, query.message.message_id, "instance")
     await safe_edit(query, service.instance_text(inst, notice=notice), service.instance_keyboard(inst))
 
 
@@ -653,12 +796,13 @@ async def command_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await service.reject(update)
         return
     context.user_data.pop("await", None)
-    await update.effective_message.reply_text(
+    msg = await update.effective_message.reply_text(
         service.home_text(0),
         parse_mode=ParseMode.HTML,
         reply_markup=service.home_keyboard(0),
         disable_web_page_preview=True,
     )
+    service.register_panel(msg.chat_id, msg.message_id, "home", 0)
 
 
 async def command_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -676,6 +820,7 @@ async def command_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         reply_markup=service.home_keyboard(0),
         disable_web_page_preview=True,
     )
+    service.register_panel(msg.chat_id, msg.message_id, "home", 0)
 
 
 async def command_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -826,6 +971,13 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if data == "nop":
         await query.answer()
         return
+
+    # Any interaction moves the live panel to this message. Default to a
+    # non-home view so the background loop keeps its hands off submenus and
+    # input prompts; render_home/render_instance immediately re-register the
+    # real view for the branches that end on one.
+    if query.message:
+        service.register_panel(query.message.chat_id, query.message.message_id, "other")
 
     # -- navigation --------------------------------------------------------
     if head == "n":
