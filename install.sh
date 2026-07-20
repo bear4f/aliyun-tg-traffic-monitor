@@ -119,7 +119,15 @@ chmod 600 "$APP_DIR/config.json" "$APP_DIR/state.json" 2>/dev/null || true
 install -m 0644 "$SRC_DIR/aliyun-traffic-bot.service" "/etc/systemd/system/${SERVICE_NAME}.service"
 ln -sfn "$APP_DIR/manage.sh" /usr/local/bin/aliyun-monitor
 systemctl daemon-reload
-systemctl enable --now "$SERVICE_NAME"
+# enable --now is a no-op on an already-active service; a plain upgrade must
+# restart it or the old code keeps running until the next reboot.
+if systemctl is-active --quiet "$SERVICE_NAME"; then
+  systemctl restart "$SERVICE_NAME"
+  echo "已重启 ${SERVICE_NAME} 以加载新版本。"
+else
+  systemctl enable --now "$SERVICE_NAME"
+fi
+systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
 
 cat <<EOF
 
