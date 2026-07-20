@@ -44,7 +44,6 @@ from common import (
     UsageSnapshot,
     burn_forecast,
     fmt_gb,
-    human_age,
     month_reset_info,
     progress_bar,
     status_cn,
@@ -96,6 +95,9 @@ class MonitorService:
 
     def now(self) -> datetime:
         return datetime.now(self.tz)
+
+    def fmt_time(self, ts: float) -> str:
+        return datetime.fromtimestamp(ts, self.tz).strftime("%Y-%m-%d %H:%M")
 
     def enabled_instances(self) -> List[Dict[str, Any]]:
         return [x for x in self.config.instances if x.get("enabled", True)]
@@ -353,7 +355,7 @@ class MonitorService:
         now = self.now()
         _, days_left = month_reset_info(now)
         checked = [s.checked_at for s in self.last_snapshots.values() if s.checked_at]
-        freshness = human_age(time.time() - max(checked)) if checked else "尚未查询"
+        freshness = self.fmt_time(max(checked)) if checked else "尚未查询"
 
         header = [
             f"<b>{title}</b>",
@@ -407,7 +409,7 @@ class MonitorService:
             lines += [
                 "",
                 f"<i>{html.escape(snap.scope_note)}</i>",
-                f"<i>更新于 {human_age(time.time() - snap.checked_at)}</i>",
+                f"<i>更新于 {self.fmt_time(snap.checked_at)}</i>",
             ]
         return "\n".join(lines)
 
