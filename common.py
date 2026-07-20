@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
 import sys
 import tempfile
@@ -30,7 +31,7 @@ LOG_PATH = Path(os.environ.get("ALIYUN_MONITOR_LOG", APP_DIR / "monitor.log"))
 SERVICE_NAME = "aliyun-traffic-bot"
 GIB = 1024 ** 3
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,24}$")
-VERSION = "3.1.3"
+VERSION = "3.1.4"
 
 PROVIDERS = {
     "ecs_cdt": "ECS / CDT",
@@ -501,8 +502,10 @@ class AliyunClient:
                 # Connect covers the TLS handshake too (urllib3 reports its
                 # expiry as a misleading "Read timed out. (read timeout=N)"),
                 # and 5s proved too tight for cdt.aliyuncs.com under jitter.
+                # Read is generous on purpose: a background monitor prefers a
+                # slow answer over a spurious failure.
                 req.set_connect_timeout(10)
-                req.set_read_timeout(15)
+                req.set_read_timeout(30)
                 for key, value in (params or {}).items():
                     req.add_query_param(key, value)
                 raw = client.do_action_with_exception(req)
@@ -514,8 +517,10 @@ class AliyunClient:
                 last_error = exc
                 if attempt + 1 < retries:
                     # Spread retries far enough apart to outlive a short
-                    # network wobble instead of burning all attempts inside it.
-                    time.sleep(3 * (2 ** attempt))
+                    # network wobble instead of burning all attempts inside
+                    # it; jitter keeps concurrent instances from retrying
+                    # against the endpoint in lockstep.
+                    time.sleep(3 * (2 ** attempt) + random.uniform(0, 2))
         raise AliyunAPIError(f"{action} 调用失败: {last_error}") from last_error
 
     def _client(self, region: Optional[str] = None):
@@ -678,6 +683,10 @@ class AliyunClient:
         if action not in action_map:
             raise AliyunAPIError(f"不支持的操作: {action}")
 
+        # Mutating power actions are sent exactly once: a timeout after the
+        # server already acted would make a blind retry double-fire (reboot)
+        # or trip over IncorrectInstanceStatus and report a success as a
+        # failure. Reads retry; writes don't.
         if provider == "swas":
             self._common_request(
                 client,
@@ -685,6 +694,7 @@ class AliyunClient:
                 "2020-06-01",
                 action_map[action],
                 {"RegionId": region, "InstanceId": instance_id, "ClientToken": str(uuid.uuid4())},
+                retries=1,
             )
             return
 
@@ -694,7 +704,9 @@ class AliyunClient:
             # instance's fixed public IP, which must never happen here. This
             # is deliberately not configurable.
             params["StoppedMode"] = "KeepCharging"
-        self._common_request(client, f"ecs.{region}.aliyuncs.com", "2014-05-26", action_map[action], params)
+        self._common_request(
+            client, f"ecs.{region}.aliyuncs.com", "2014-05-26", action_map[action], params, retries=1
+        )
 
 
 # --------------------------------------------------------------------------
