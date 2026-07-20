@@ -31,7 +31,7 @@ LOG_PATH = Path(os.environ.get("ALIYUN_MONITOR_LOG", APP_DIR / "monitor.log"))
 SERVICE_NAME = "aliyun-traffic-bot"
 GIB = 1024 ** 3
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,24}$")
-VERSION = "3.1.4"
+VERSION = "3.2.0"
 
 PROVIDERS = {
     "ecs_cdt": "ECS / CDT",
@@ -173,6 +173,25 @@ def month_reset_info(now: datetime) -> Tuple[datetime, int]:
     return nxt, max(0, (nxt - now).days)
 
 
+def rolling_rate(
+    samples: List[Dict[str, Any]], now_ts: float, window_seconds: float
+) -> Optional[float]:
+    """Average usage growth in bytes/day over the trailing window, computed
+    from periodic {t, u} samples. Month resets (usage dropping) contribute
+    zero rather than negative growth. Returns None when the window holds too
+    little history for an honest estimate."""
+    pts = [s for s in samples if float(s.get("t", 0)) >= now_ts - window_seconds]
+    if len(pts) < 2:
+        return None
+    span = float(pts[-1]["t"]) - float(pts[0]["t"])
+    if span < window_seconds * 0.4:
+        return None
+    total = 0.0
+    for prev, cur in zip(pts, pts[1:]):
+        total += max(0.0, float(cur.get("u", 0)) - float(prev.get("u", 0)))
+    return total / span * 86400.0
+
+
 def burn_forecast(
     used_bytes: int, total_bytes: int, shutdown_percent: int, now: datetime
 ) -> Tuple[float, Optional[float]]:
@@ -268,6 +287,7 @@ def instance_defaults(inst: Dict[str, Any]) -> Dict[str, Any]:
     inst.setdefault("enabled", True)
     inst.setdefault("auto_shutdown", True)
     inst.setdefault("shutdown_percent", 95)
+    inst.setdefault("emergency_shutdown_percent", 98)
     inst.setdefault("auto_start_next_month", False)
     inst.setdefault("allow_manual_control", True)
     if inst.get("provider") == "ecs_cdt":
@@ -342,6 +362,9 @@ class ConfigStore:
             instance_defaults(inst)
             try:
                 inst["shutdown_percent"] = min(100, max(1, int(inst["shutdown_percent"])))
+                inst["emergency_shutdown_percent"] = min(
+                    99, max(1, int(inst["emergency_shutdown_percent"]))
+                )
             except (TypeError, ValueError) as exc:
                 raise ConfigError(f"{key}: shutdown_percent 必须是 1-100") from exc
             if provider == "ecs_cdt":

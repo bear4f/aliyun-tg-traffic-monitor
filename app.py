@@ -13,7 +13,7 @@ import asyncio
 import html
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -46,6 +46,8 @@ from common import (
     fmt_gb,
     month_reset_info,
     progress_bar,
+    rolling_rate,
+    severity,
     status_cn,
     status_icon,
 )
@@ -76,6 +78,7 @@ class MonitorService:
         self.lock = asyncio.Lock()
         self.log = logging.getLogger("monitor")
         self.last_snapshots: Dict[str, UsageSnapshot] = {}
+        self.started_at = time.time()
         self.hydrate()
 
     # -- lifecycle ---------------------------------------------------------
@@ -113,6 +116,29 @@ class MonitorService:
     def enabled_instances(self) -> List[Dict[str, Any]]:
         return [x for x in self.config.instances if x.get("enabled", True)]
 
+    def log_event(self, text: str) -> None:
+        """Append to the panel-visible audit trail: breaker trips, power
+        actions, config changes, query outages. Routine successful checks
+        stay out so the log doesn't drown."""
+        events = self.state.data.setdefault("events", [])
+        events.append({"t": time.time(), "text": text})
+        del events[:-50]
+        self.state.save()
+
+    def _bump_api_stats(self, ok: bool) -> None:
+        stats = self.state.data.setdefault("api_stats", {})
+        bucket = datetime.now(self.tz).strftime("%Y%m%d%H")
+        pair = stats.setdefault(bucket, [0, 0])
+        pair[0 if ok else 1] += 1
+        for stale in sorted(stats)[:-24]:
+            stats.pop(stale, None)
+
+    def api_stats_24h(self) -> Tuple[int, int]:
+        stats = self.state.data.get("api_stats") or {}
+        ok = sum(int(v[0]) for v in stats.values())
+        fail = sum(int(v[1]) for v in stats.values())
+        return ok, fail
+
     def is_authorized(self, update: Update) -> bool:
         user = update.effective_user
         return bool(user and user.id in self.config.telegram["admin_user_ids"])
@@ -139,6 +165,7 @@ class MonitorService:
                 st["error_since"] = time.time()
             st["last_error"] = str(exc)
             st["last_error_at"] = time.time()
+            self._bump_api_stats(ok=False)
             self.state.save()
             return UsageSnapshot(
                 instance_key=inst["id"],
@@ -166,8 +193,15 @@ class MonitorService:
         st["last_error_at"] = 0
         st["error_notified"] = False
         st["last_error_notify"] = 0
+        self._bump_api_stats(ok=True)
         self.last_snapshots[inst["id"]] = snap
         st["last_snapshot"] = snap.to_state()
+        # Hourly usage samples power the 24h/7d rolling rates and the
+        # month-end forecast; ~200 points ≈ 8 days.
+        hist = st.setdefault("usage_history", [])
+        if not hist or snap.checked_at - float(hist[-1].get("t", 0)) >= 3600:
+            hist.append({"t": snap.checked_at, "u": snap.used_bytes})
+            del hist[:-200]
         self.state.save()
         return snap
 
@@ -198,11 +232,13 @@ class MonitorService:
             s["warned_levels"] = []
             s["pending_auto_start"] = previous_shutdown and bool(inst.get("auto_start_next_month"))
             s["shutdown_triggered"] = False
+            s["over_threshold_checks"] = 0
             s["last_error_notify"] = 0
         self.state.data["month"] = current_month
         self.state.save()
         if old_month:
             self.log.info("账期切换: %s -> %s", old_month, current_month)
+            self.log_event(f"账期切换 {old_month} → {current_month}，提醒线与熔断标记已重置")
             await self.send_notify(
                 app,
                 f"🗓️ <b>新账期已开始</b>\n{html.escape(old_month)} → {html.escape(current_month)}\n"
@@ -231,6 +267,8 @@ class MonitorService:
                     # the notification channel entirely — the panel card shows
                     # the streak, and it clears itself on recovery.
                     streak = int(st.get("error_streak", 1) or 1)
+                    if streak == 1:
+                        self.log_event(f"{inst['name']} 查询开始失败")
                     threshold = int(self.config.monitor["error_notify_after_failures"])
                     cooldown = int(self.config.monitor["error_notify_cooldown_seconds"])
                     if (
@@ -255,10 +293,16 @@ class MonitorService:
                     self.state.save()
                     continue
 
-                if st.pop("recovered", None) is not None:
+                recovered = st.pop("recovered", None)
+                if recovered is not None:
                     # Recovery is silent: retract the failure notices we sent
                     # (if any) and let the panel going back to normal tell the
                     # rest of the story.
+                    since = float(recovered.get("since", 0) or 0)
+                    minutes = max(1, int((float(recovered.get("at", time.time())) - since) / 60)) if since else 1
+                    self.log_event(
+                        f"{inst['name']} 查询恢复（失败 {recovered.get('streak', 1)} 次，约 {minutes} 分钟）"
+                    )
                     for ref in st.pop("error_notify_msgs", []) or []:
                         try:
                             await app.bot.delete_message(
@@ -273,6 +317,7 @@ class MonitorService:
                         try:
                             await self.api_control(inst, "start")
                             st["pending_auto_start"] = False
+                            self.log_event(f"{inst['name']} 新账期自动开机")
                             await self.send_notify(
                                 app,
                                 f"▶️ <b>{html.escape(inst['name'])}</b> 新账期流量已重置，已自动开机。",
@@ -285,35 +330,63 @@ class MonitorService:
                 warned = {int(x) for x in st.get("warned_levels", [])}
                 for level in self.config.monitor["warning_percentages"]:
                     if snap.percent >= level and level not in warned:
+                        self.log_event(f"{inst['name']} 流量达到 {level}% 提醒线")
                         await self.send_notify(app, self.format_alert(inst, snap, f"达到 {level}% 提醒线"))
                         warned.add(level)
                 st["warned_levels"] = sorted(warned)
 
-                shutdown_percent = int(inst.get("shutdown_percent", 95))
+                # Double-threshold breaker: the soft line needs two
+                # consecutive successful readings over it (guards against a
+                # single bad API answer or a mis-set quota killing a box),
+                # the emergency line fires on one.
+                soft = int(inst.get("shutdown_percent", 95))
+                hard = self.hard_percent(inst)
                 if (
                     enforce
                     and inst.get("auto_shutdown", True)
-                    and snap.percent >= shutdown_percent
                     and not st.get("shutdown_triggered", False)
                 ):
-                    if snap.status == "Running":
-                        try:
-                            await self.api_control(inst, "stop")
-                            st["shutdown_triggered"] = True
-                            await self.send_notify(app, self.format_alert(inst, snap, "已触发自动关机 🛑"))
-                        except Exception as exc:
-                            await self.send_notify(
-                                app, self.format_alert(inst, snap, f"自动关机失败：{exc}")
+                    reason = ""
+                    if snap.percent >= hard:
+                        reason = f"已达紧急熔断线 {hard}%"
+                    elif snap.percent >= soft:
+                        over = int(st.get("over_threshold_checks", 0) or 0) + 1
+                        st["over_threshold_checks"] = over
+                        if over >= 2:
+                            reason = f"连续 {over} 次确认超过熔断线 {soft}%"
+                        else:
+                            self.log_event(
+                                f"{inst['name']} 达到熔断线 {soft}%，等待下次检查复核"
                             )
-                    elif snap.status == "Stopped":
-                        st["shutdown_triggered"] = True
-                        await self.send_notify(
-                            app, self.format_alert(inst, snap, "流量已超阈值，实例当前已关机")
-                        )
                     else:
-                        self.log.warning(
-                            "%s 已超阈值但状态为 %s，暂不发送停机", inst["name"], snap.status
-                        )
+                        st["over_threshold_checks"] = 0
+
+                    if reason:
+                        st["over_threshold_checks"] = 0
+                        if snap.status == "Running":
+                            try:
+                                await self.api_control(inst, "stop")
+                                st["shutdown_triggered"] = True
+                                self.log_event(f"{inst['name']} 自动关机（{reason}）")
+                                await self.send_notify(
+                                    app,
+                                    self.format_alert(inst, snap, f"已触发自动关机 🛑（{reason}）"),
+                                )
+                            except Exception as exc:
+                                self.log_event(f"{inst['name']} 自动关机失败：{str(exc)[:80]}")
+                                await self.send_notify(
+                                    app, self.format_alert(inst, snap, f"自动关机失败：{exc}")
+                                )
+                        elif snap.status == "Stopped":
+                            st["shutdown_triggered"] = True
+                            self.log_event(f"{inst['name']} 流量超阈值（{reason}），实例已处于关机状态")
+                            await self.send_notify(
+                                app, self.format_alert(inst, snap, "流量已超阈值，实例当前已关机")
+                            )
+                        else:
+                            self.log.warning(
+                                "%s 已超阈值但状态为 %s，暂不发送停机", inst["name"], snap.status
+                            )
 
                 self.state.save()
             return snapshots
@@ -404,20 +477,66 @@ class MonitorService:
             f"<i>{html.escape(snap.scope_note)}</i>"
         )
 
+    def forecast(self, inst: Dict[str, Any], snap: UsageSnapshot) -> Dict[str, Any]:
+        """Burn-rate forecast from rolling 24h/7d rates over the sampled
+        history, falling back to the month-to-date average when history is
+        thin. rate = max(24h, 7d) so a sudden surge shows up quickly."""
+        soft = int(inst.get("shutdown_percent", 95))
+        now = self.now()
+        now_ts = time.time()
+        hist = self.state.instance(inst["id"]).get("usage_history") or []
+        rate24 = rolling_rate(hist, now_ts, 86400)
+        rate7 = rolling_rate(hist, now_ts, 7 * 86400)
+        rate = max((r for r in (rate24, rate7) if r is not None), default=None)
+        if rate is None:
+            daily, _ = burn_forecast(snap.used_bytes, snap.total_bytes, soft, now)
+            rate = daily if daily > 0 else None
+
+        reset_at, _ = month_reset_info(now)
+        days_to_reset = max(0.0, (reset_at - now).total_seconds() / 86400)
+        end_bytes = snap.used_bytes + rate * days_to_reset if rate else None
+        threshold_bytes = snap.total_bytes * soft / 100.0
+
+        hit_at: Optional[datetime] = None
+        reached = snap.total_bytes > 0 and snap.used_bytes >= threshold_bytes
+        if not reached and rate and snap.total_bytes > 0:
+            days = (threshold_bytes - snap.used_bytes) / rate
+            if days <= days_to_reset:
+                hit_at = now + timedelta(days=days)
+        return {
+            "rate": rate,
+            "rate24": rate24,
+            "rate7": rate7,
+            "end_bytes": end_bytes,
+            "hit_at": hit_at,
+            "reached": reached,
+        }
+
     def pace_line(self, inst: Dict[str, Any], snap: UsageSnapshot) -> str:
         """One compact burn-rate line, empty when no meaningful estimate."""
-        daily, days = burn_forecast(
-            snap.used_bytes, snap.total_bytes, int(inst.get("shutdown_percent", 95)), self.now()
-        )
-        if daily <= 0:
+        f = self.forecast(inst, snap)
+        if not f["rate"]:
             return ""
-        if days is None:
-            return f"📈 日均 {fmt_gb(daily, 1)} · 本账期无触线风险"
-        if days == 0.0:
-            return f"📈 日均 {fmt_gb(daily, 1)} · 已达熔断线"
-        if days < 1:
-            return f"📈 日均 {fmt_gb(daily, 1)} · ⚠️ 不足 1 天触线"
-        return f"📈 日均 {fmt_gb(daily, 1)} · 约 {days:.0f} 天后触线"
+        line = f"📈 日均 {fmt_gb(f['rate'], 1)}"
+        if f["end_bytes"] is not None:
+            line += f" · 🔮 预计月底 {fmt_gb(f['end_bytes'], 0)}"
+        if f["reached"]:
+            line += " · 🛑 已达熔断线"
+        elif f["hit_at"] is not None:
+            line += f" · ⚠️ 约 {f['hit_at']:%m-%d} 触线"
+        else:
+            line += " · 无触线风险"
+        return line
+
+    def pct_icon(self, percent: float, shutdown_percent: int) -> str:
+        return {"ok": "🟢", "warn": "🟡", "crit": "🔴"}[severity(percent, shutdown_percent)]
+
+    @staticmethod
+    def hard_percent(inst: Dict[str, Any]) -> int:
+        """Emergency breaker: one confirmed reading at/above this fires
+        immediately, no second-cycle confirmation. Never below the soft line."""
+        soft = int(inst.get("shutdown_percent", 95))
+        return max(soft, min(99, int(inst.get("emergency_shutdown_percent", 98))))
 
     def instance_block(self, inst: Dict[str, Any]) -> str:
         """One expanded machine card for the home panel."""
@@ -447,7 +566,8 @@ class MonitorService:
         resume = "开" if inst.get("auto_start_next_month") else "关"
         line = (
             f"{status_icon(snap.status)} <b>{name}</b> · {html.escape(status_cn(snap.status))}\n"
-            f"<code>{progress_bar(snap.percent)}</code> <b>{snap.percent:.1f}%</b>\n"
+            f"<code>{progress_bar(snap.percent)}</code> <b>{snap.percent:.1f}%</b> "
+            f"{self.pct_icon(snap.percent, threshold)}\n"
             f"{fmt_gb(snap.used_bytes)} / {fmt_gb(snap.total_bytes)} · 剩余 {fmt_gb(snap.remaining_bytes)}\n"
             f"🛡️ 熔断 {threshold}% {shield} · 🗓️ 下月开机 {resume}"
         )
@@ -475,15 +595,23 @@ class MonitorService:
         page, total_pages, items = self.page_instances(page)
         now = self.now()
         _, days_left = month_reset_info(now)
+        interval = int(self.config.monitor["interval_seconds"])
         checked = [s.checked_at for s in self.last_snapshots.values() if s.checked_at]
-        freshness = self.fmt_time(max(checked)) if checked else "尚未查询"
+        if checked:
+            age = time.time() - max(checked)
+            # ≤2 cycles: live; ≤6: delayed; beyond: stale — tells "traffic is
+            # safe" apart from "the monitor itself is unhealthy" at a glance.
+            dot = "🟢" if age <= 2 * interval else ("🟡" if age <= 6 * interval else "🔴")
+            freshness = f"{dot} {self.fmt_time(max(checked))}"
+        else:
+            freshness = "⚪ 尚未查询"
         failing = sum(
             1
             for inst in self.enabled_instances()
             if int(self.state.instance(inst["id"]).get("error_streak", 0) or 0) > 0
         )
         watch = (
-            f"🛰️ 每 {self.fmt_interval(int(self.config.monitor['interval_seconds']))}自动检查"
+            f"🛰️ 每 {self.fmt_interval(interval)}自动检查"
             f" · 数据更新于 {freshness}"
         )
         if failing:
@@ -525,24 +653,68 @@ class MonitorService:
         streak = int(st.get("error_streak", 0) or 0)
         good = snap is not None and not snap.error
         if good:
+            soft = int(inst.get("shutdown_percent", 95))
             lines += [
                 f"状态：{status_icon(snap.status)} <b>{html.escape(status_cn(snap.status))}</b>",
-                f"<code>{progress_bar(snap.percent, 16)}</code> <b>{snap.percent:.1f}%</b>",
+                f"<code>{progress_bar(snap.percent, 16)}</code> <b>{snap.percent:.1f}%</b> "
+                f"{self.pct_icon(snap.percent, soft)}",
                 f"本月已用：<b>{fmt_gb(snap.used_bytes)}</b> / {fmt_gb(snap.total_bytes)}",
                 f"剩余：<b>{fmt_gb(snap.remaining_bytes)}</b>",
             ]
-            pace = self.pace_line(inst, snap)
-            if pace:
-                lines.append(pace)
+            f = self.forecast(inst, snap)
+            trend = []
+            if f["rate24"] is not None:
+                trend.append(f"24 小时 {fmt_gb(f['rate24'], 1)}/日")
+            if f["rate7"] is not None:
+                trend.append(f"7 日均 {fmt_gb(f['rate7'], 1)}/日")
+            if trend:
+                lines.append("📈 " + " · ".join(trend))
+            elif f["rate"]:
+                lines.append(f"📈 本月日均 {fmt_gb(f['rate'], 1)}")
+            if f["end_bytes"] is not None:
+                if f["reached"]:
+                    risk = "🛑 已达熔断线"
+                elif f["hit_at"] is not None:
+                    risk = f"⚠️ 预计 {f['hit_at']:%m-%d} 触线"
+                else:
+                    risk = "无触线风险"
+                lines.append(f"🔮 预计月底 {fmt_gb(f['end_bytes'], 0)} · {risk}")
+            if inst.get("auto_shutdown", True):
+                lines.append(
+                    f"🛡️ 熔断 {soft}%（连续 2 次确认）· 🚨 紧急 {self.hard_percent(inst)}%（立即）"
+                )
+                if snap.total_bytes > 0:
+                    lines.append(f"⛔ 实际关机线约 {fmt_gb(snap.total_bytes * soft / 100.0)}")
             if st.get("shutdown_triggered"):
                 lines.append("🛑 本账期已触发过自动熔断（新账期自动解除）")
             if snap.overflow_bytes > 0:
                 lines.append(f"❗ 已超额：<b>{fmt_gb(snap.overflow_bytes)}</b>")
+            source = (
+                "ListCdtInternetTraffic"
+                if inst.get("provider") == "ecs_cdt"
+                else "ListInstancesTrafficPackages"
+            )
             lines += [
                 "",
                 f"<i>{html.escape(snap.scope_note)}</i>",
+                f"<i>额度 {float(inst.get('quota_gb', 0)):g} GB（GiB 口径）· 数据源 {source}</i>"
+                if inst.get("provider") == "ecs_cdt"
+                else f"<i>数据源 {source}</i>",
                 f"<i>更新于 {self.fmt_time(snap.checked_at)}</i>",
             ]
+            twins = [
+                html.escape(x["name"])
+                for x in self.enabled_instances()
+                if x["id"] != inst["id"]
+                and x.get("provider") == "ecs_cdt"
+                and inst.get("provider") == "ecs_cdt"
+                and x.get("access_key_id") == inst.get("access_key_id")
+                and x.get("traffic_scope", "overseas") == inst.get("traffic_scope", "overseas")
+            ]
+            if twins:
+                lines.append(
+                    f"<i>⚠️ 与 {'、'.join(twins)} 共用同一账号与口径，流量为账号级共享值</i>"
+                )
         if streak or (snap is not None and snap.error):
             err = str(st.get("last_error") or (snap.error if snap else "") or "")
             when = (
@@ -577,8 +749,51 @@ class MonitorService:
                 f"并发查询数：<b>{m['max_concurrency']}</b>",
                 f"每页机器数：<b>{m['telegram_page_size']}</b>",
                 "",
+                "🤖 <b>Bot 状态</b>",
+                f"运行时长：{self.fmt_uptime()}",
+                f"24 小时 API 成功率：{self.fmt_api_rate()}",
+                "",
                 f"<i>共 {len(self.config.instances)} 台，启用 {len(self.enabled_instances())} 台</i>",
                 f"<i>版本 {VERSION}</i>",
+            ]
+        )
+
+    def fmt_uptime(self) -> str:
+        seconds = int(time.time() - self.started_at)
+        days, rem = divmod(seconds, 86400)
+        hours, rem = divmod(rem, 3600)
+        minutes = rem // 60
+        if days:
+            return f"{days} 天 {hours} 小时"
+        if hours:
+            return f"{hours} 小时 {minutes} 分钟"
+        return f"{max(1, minutes)} 分钟"
+
+    def fmt_api_rate(self) -> str:
+        ok, fail = self.api_stats_24h()
+        total = ok + fail
+        if not total:
+            return "暂无数据"
+        return f"{ok / total * 100:.1f}%（{ok}/{total} 次，失败 {fail} 次）"
+
+    def events_text(self) -> str:
+        events = list(reversed(self.state.data.get("events") or []))[:15]
+        lines = ["📋 <b>事件记录</b>", ""]
+        if not events:
+            lines.append("<i>暂无事件。熔断、开关机、阈值修改、查询异常等关键动作会记录在这里。</i>")
+        else:
+            for e in events:
+                stamp = self.fmt_time(float(e.get("t", 0)))[5:]  # MM-DD HH:MM
+                lines.append(f"<code>{stamp}</code> {html.escape(str(e.get('text', '')))}")
+            lines += ["", "<i>保留最近 50 条，此处显示 15 条；例行的成功查询不记录。</i>"]
+        return "\n".join(lines)
+
+    @staticmethod
+    def events_keyboard() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("🔄 刷新记录", callback_data="n:e")],
+                [InlineKeyboardButton(HOME, callback_data="n:h:0")],
             ]
         )
 
@@ -597,17 +812,28 @@ class MonitorService:
     def home_keyboard(self, page: int = 0) -> InlineKeyboardMarkup:
         page, total_pages, items = self.page_instances(page)
         rows: List[List[InlineKeyboardButton]] = [
-            [InlineKeyboardButton("🔄 刷新全部", callback_data=f"r:a:{page}")]
+            [
+                InlineKeyboardButton("🔄 刷新全部", callback_data=f"r:a:{page}"),
+                InlineKeyboardButton("📋 事件记录", callback_data="n:e"),
+            ]
         ]
+        # Power buttons live only inside the per-machine page (with its own
+        # confirmation step) — the home view is a read-only overview.
+        row: List[InlineKeyboardButton] = []
         for inst in items:
             key = inst["id"]
-            row = [InlineKeyboardButton(f"⚙️ {inst['name']}", callback_data=f"n:i:{key}")]
             snap = self.last_snapshots.get(key)
-            if inst.get("allow_manual_control", True) and snap and not snap.error:
-                if snap.status == "Running":
-                    row.append(InlineKeyboardButton("⏹️ 关机", callback_data=f"c:{key}:stop"))
-                elif snap.status == "Stopped":
-                    row.append(InlineKeyboardButton("▶️ 开机", callback_data=f"c:{key}:start"))
+            if snap and not snap.error:
+                label = (
+                    f"{status_icon(snap.status)} {inst['name']} · {snap.percent:.1f}%"
+                )
+            else:
+                label = f"⚙️ {inst['name']}"
+            row.append(InlineKeyboardButton(label, callback_data=f"n:i:{key}"))
+            if len(row) == 2:
+                rows.append(row)
+                row = []
+        if row:
             rows.append(row)
         if total_pages > 1:
             nav: List[InlineKeyboardButton] = []
@@ -885,7 +1111,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 value = float(raw)
                 if value <= 0:
                     raise ValueError
+                old_quota = float(inst.get("quota_gb", 0))
                 inst["quota_gb"] = value
+                if value != old_quota:
+                    service.log_event(
+                        f"管理员将 {inst['name']} 月度额度 {old_quota:g} GB → {value:g} GB"
+                    )
         elif kind == "warning_percentages":
             levels = sorted({int(x.strip()) for x in raw.split(",") if x.strip()})
             if not levels or any(x < 1 or x > 99 for x in levels):
@@ -1001,6 +1232,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 await render_home(service, query, 0)
                 return
             await render_instance(service, query, inst)
+        elif target == "e":
+            await safe_edit(query, service.events_text(), service.events_keyboard())
         elif target == "g":
             await safe_edit(query, service.global_text(), service.global_keyboard())
         elif target == "a":
@@ -1106,14 +1339,28 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             service.state.instance(key)["shutdown_triggered"] = False
             service.state.save()
         service.config.save()
+        field_cn = {
+            "auto_shutdown": "自动熔断",
+            "auto_start_next_month": "下月自动开机",
+            "allow_manual_control": "手动控制",
+            "enabled": "监控",
+        }[field]
+        service.log_event(
+            f"管理员将 {inst['name']} 的{field_cn}设为{'开' if inst[field] else '关'}"
+        )
         await query.answer(f"已{'开启' if inst[field] else '关闭'}")
         await render_instance(service, query, inst)
         return
 
     if head == "p":
         delta = int(parts[2])
-        inst["shutdown_percent"] = min(100, max(1, int(inst.get("shutdown_percent", 95)) + delta))
+        old = int(inst.get("shutdown_percent", 95))
+        inst["shutdown_percent"] = min(100, max(1, old + delta))
         service.config.save()
+        if inst["shutdown_percent"] != old:
+            service.log_event(
+                f"管理员将 {inst['name']} 熔断阈值 {old}% → {inst['shutdown_percent']}%"
+            )
         await query.answer(f"阈值 {inst['shutdown_percent']}%")
         await render_instance(service, query, inst)
         return
@@ -1173,8 +1420,10 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         try:
             await service.api_control(inst, action)
+            service.log_event(f"管理员手动{ACTION_CN[action]} {inst['name']}")
             note = f"✅ 已发送 <b>{ACTION_CN[action]}</b> 指令 · {service.now():%H:%M:%S}\n<i>实例状态需要几十秒才会变化，稍后点刷新确认。</i>"
         except Exception as exc:
+            service.log_event(f"管理员手动{ACTION_CN[action]} {inst['name']} 失败")
             note = f"❌ 操作失败 · {service.now():%H:%M:%S}\n<code>{html.escape(str(exc)[:500])}</code>"
         await safe_edit(query, service.instance_text(inst) + "\n\n" + note, service.instance_keyboard(inst))
         return

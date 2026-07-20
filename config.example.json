@@ -35,6 +35,7 @@
       "enabled": true,
       "auto_shutdown": true,
       "shutdown_percent": 90,
+      "emergency_shutdown_percent": 98,
       "auto_start_next_month": false,
       "allow_manual_control": true,
       "stopped_mode": "KeepCharging"
