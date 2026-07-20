@@ -30,7 +30,7 @@ LOG_PATH = Path(os.environ.get("ALIYUN_MONITOR_LOG", APP_DIR / "monitor.log"))
 SERVICE_NAME = "aliyun-traffic-bot"
 GIB = 1024 ** 3
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,24}$")
-VERSION = "3.1.0"
+VERSION = "3.1.1"
 
 PROVIDERS = {
     "ecs_cdt": "ECS / CDT",
@@ -494,7 +494,10 @@ class AliyunClient:
                 # requests). The widely-copied 5000/15000 "milliseconds"
                 # actually meant 83 minutes / 4 hours and could hang a worker
                 # thread — and with it the whole update queue — for ages.
-                req.set_connect_timeout(5)
+                # Connect covers the TLS handshake too (urllib3 reports its
+                # expiry as a misleading "Read timed out. (read timeout=N)"),
+                # and 5s proved too tight for cdt.aliyuncs.com under jitter.
+                req.set_connect_timeout(10)
                 req.set_read_timeout(15)
                 for key, value in (params or {}).items():
                     req.add_query_param(key, value)
@@ -506,7 +509,9 @@ class AliyunClient:
             except Exception as exc:  # the SDK raises several unrelated classes
                 last_error = exc
                 if attempt + 1 < retries:
-                    time.sleep(1.5 * (2 ** attempt))
+                    # Spread retries far enough apart to outlive a short
+                    # network wobble instead of burning all attempts inside it.
+                    time.sleep(3 * (2 ** attempt))
         raise AliyunAPIError(f"{action} 调用失败: {last_error}") from last_error
 
     def _client(self, region: Optional[str] = None):
