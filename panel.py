@@ -42,6 +42,7 @@ from common import (
     StateStore,
     atomic_write_json,
     bad,
+    billing_now,
     bold,
     burn_forecast,
     default_config,
@@ -227,12 +228,14 @@ def print_status_bar(data: Dict[str, Any]) -> None:
     except Exception:
         tz = ZoneInfo("UTC")
     now = datetime.now(tz)
-    _, days_left = month_reset_info(now)
+    # The billing month rolls over on Aliyun's clock, not the operator's.
+    billing = billing_now()
+    _, days_left = month_reset_info(billing)
 
     rule(f"Aliyun Traffic Monitor {VERSION}")
     print(
         f"  服务 {render_service_line()}    "
-        f"账期 {bold(now.strftime('%Y-%m'))} · {bold(str(days_left))} 天后重置    "
+        f"账期 {bold(billing.strftime('%Y-%m'))} · {bold(str(days_left))} 天后重置    "
         f"机器 {bold(str(len(instances)))} 台"
     )
 
@@ -265,7 +268,7 @@ def print_status_bar(data: Dict[str, Any]) -> None:
         usage = f"{fmt_gb(raw.get('used_bytes', 0))} / {fmt_gb(raw.get('total_bytes', 0))}"
         age = human_age(time.time() - float(raw.get("checked_at", 0)))
         daily, days = burn_forecast(
-            int(raw.get("used_bytes", 0)), int(raw.get("total_bytes", 0)), threshold, now
+            int(raw.get("used_bytes", 0)), int(raw.get("total_bytes", 0)), threshold, billing
         )
         pace = ""
         if daily > 0:
@@ -653,8 +656,12 @@ def doctor(data: Dict[str, Any]) -> int:
     try:
         tz = ZoneInfo(str(data.get("monitor", {}).get("timezone", "Asia/Taipei")))
         now = datetime.now(tz)
-        _, days_left = month_reset_info(now)
-        print(f"  {ok('✔')} 当前 {now:%Y-%m-%d %H:%M} · 账期 {now:%Y-%m} · {days_left} 天后重置")
+        billing = billing_now()
+        _, days_left = month_reset_info(billing)
+        print(
+            f"  {ok('✔')} 当前 {now:%Y-%m-%d %H:%M} · "
+            f"账期 {billing:%Y-%m}（Asia/Shanghai）· {days_left} 天后重置"
+        )
     except Exception as exc:
         problems += 1
         print(f"  {bad('✖')} 时区无效：{exc}")

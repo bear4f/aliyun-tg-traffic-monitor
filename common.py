@@ -31,7 +31,13 @@ LOG_PATH = Path(os.environ.get("ALIYUN_MONITOR_LOG", APP_DIR / "monitor.log"))
 SERVICE_NAME = "aliyun-traffic-bot"
 GIB = 1024 ** 3
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,24}$")
-VERSION = "3.2.0"
+VERSION = "3.3.0"
+
+# Aliyun bills and resets the CDT free quota on Beijing time, regardless of the
+# timezone the operator picked for display. Deriving the billing month from the
+# display timezone would flip the month (and reset the warning/breaker latches)
+# hours early or late for anyone outside UTC+8.
+BILLING_TZ = ZoneInfo("Asia/Shanghai")
 
 PROVIDERS = {
     "ecs_cdt": "ECS / CDT",
@@ -122,18 +128,32 @@ def gib(value: int | float) -> float:
     return float(value) / GIB
 
 
-def fmt_gb(value: int | float, digits: int = 2) -> str:
-    return f"{gib(value):.{digits}f} GB"
+def fmt_gb(value: int | float, digits: int = 2, unit: bool = True) -> str:
+    return f"{gib(value):.{digits}f}" + (" GB" if unit else "")
 
 
-def progress_bar(percent: float, width: int = 12) -> str:
+# Terminal fonts render the block elements crisply; Telegram's monospace font
+# makes the same pair look heavy and noisy, where the geometric bars read as a
+# proper meter. Same widths in both sets, so the meters still line up.
+BAR_STYLES = {
+    "blocks": ("█", "░"),
+    "bars": ("▰", "▱"),
+}
+
+
+def progress_bar(percent: float, width: int = 12, style: str = "blocks") -> str:
     """Unicode meter that stays readable in both Telegram and a terminal."""
+    filled_char, empty_char = BAR_STYLES.get(style, BAR_STYLES["blocks"])
     ratio = max(0.0, min(1.0, percent / 100.0))
     filled = int(round(ratio * width))
-    # Never show a completely empty bar for non-zero usage.
+    # Never show a completely empty bar for non-zero usage, and never show a
+    # completely full one below 100% — a bar that reads "full" at 99.4% is the
+    # difference between "still fine" and "act now".
     if percent > 0 and filled == 0:
         filled = 1
-    return "█" * filled + "░" * (width - filled)
+    if percent < 100 and filled == width:
+        filled = width - 1
+    return filled_char * filled + empty_char * (width - filled)
 
 
 def severity(percent: float, shutdown_percent: int) -> str:
@@ -162,6 +182,12 @@ def status_cn(status: str) -> str:
         "Stopping": "关机中",
         "Unknown": "未知",
     }.get(status, status)
+
+
+def billing_now() -> datetime:
+    """Current time in Aliyun's billing timezone — the clock that actually
+    decides when the monthly CDT quota rolls over."""
+    return datetime.now(BILLING_TZ)
 
 
 def month_reset_info(now: datetime) -> Tuple[datetime, int]:
@@ -303,6 +329,35 @@ class ConfigStore:
         self.path = path
         self.data = read_json(path)
         self.validate()
+        self._mtime = self._current_mtime()
+
+    def _current_mtime(self) -> int:
+        try:
+            return self.path.stat().st_mtime_ns
+        except OSError:
+            return 0
+
+    def reload_if_changed(self) -> bool:
+        """Pick up edits made by the terminal panel (or by hand) without a
+        restart. Without this the long-lived bot holds a stale copy and the
+        next Telegram-side save silently overwrites those edits.
+
+        The in-memory config is only swapped in once the new file validates,
+        so a half-written or broken file leaves the running config intact.
+        """
+        mtime = self._current_mtime()
+        if mtime == self._mtime or mtime == 0:
+            return False
+        previous = self.data
+        try:
+            self.data = read_json(self.path)
+            self.validate()
+        except ConfigError:
+            self.data = previous
+            self._mtime = mtime  # don't re-read the same broken file every tick
+            raise
+        self._mtime = mtime
+        return True
 
     def validate(self) -> None:
         telegram = self.data.get("telegram")
@@ -400,6 +455,7 @@ class ConfigStore:
     def save(self) -> None:
         self.validate()
         atomic_write_json(self.path, self.data, 0o600)
+        self._mtime = self._current_mtime()
 
 
 class StateStore:
