@@ -266,6 +266,11 @@ class MonitorService:
         st["last_error_at"] = 0
         st["error_notified"] = False
         st["last_error_notify"] = 0
+        # The traffic read succeeded; a failed power-state read is recorded
+        # beside it rather than treated as an outage.
+        st["status_error"] = snap.status_error
+        if not snap.status_error:
+            st["unknown_status_notified"] = False
         self._bump_api_stats(ok=True)
         self.last_snapshots[inst["id"]] = snap
         st["last_snapshot"] = snap.to_state()
@@ -318,10 +323,22 @@ class MonitorService:
                 f"提醒线与熔断标记已重置。",
             )
 
-    async def check_once(self, app: Application, enforce: bool = True) -> List[UsageSnapshot]:
+    def failing_ids(self) -> List[str]:
+        return [
+            inst["id"]
+            for inst in self.enabled_instances()
+            if int(self.state.instance(inst["id"]).get("error_streak", 0) or 0) > 0
+        ]
+
+    async def check_once(
+        self, app: Application, enforce: bool = True, only: Optional[List[str]] = None
+    ) -> List[UsageSnapshot]:
         async with self.lock:
             await self._handle_month_change(app, self.billing_now().strftime("%Y-%m"))
             enabled = self.enabled_instances()
+            if only is not None:
+                wanted = set(only)
+                enabled = [x for x in enabled if x["id"] in wanted]
             semaphore = asyncio.Semaphore(int(self.config.monitor["max_concurrency"]))
 
             async def fetch(inst: Dict[str, Any]) -> Tuple[Dict[str, Any], UsageSnapshot]:
@@ -340,9 +357,16 @@ class MonitorService:
                     # the notification channel entirely — the panel card shows
                     # the streak, and it clears itself on recovery.
                     streak = int(st.get("error_streak", 1) or 1)
-                    if streak == 1:
-                        self.log_event(f"{inst['name']} 查询开始失败")
                     threshold = int(self.config.monitor["error_notify_after_failures"])
+                    # A blip that clears on the next check is not an event —
+                    # logging every one of them fills all 50 slots with
+                    # failure/recovery pairs and pushes the breaker trips and
+                    # config changes (the things worth keeping) off the list.
+                    if streak == threshold:
+                        self.log_event(
+                            f"{inst['name']} 连续 {streak} 次查询失败：{str(snap.error)[:60]}"
+                        )
+                        st["outage_logged"] = True
                     cooldown = int(self.config.monitor["error_notify_cooldown_seconds"])
                     if (
                         streak >= threshold
@@ -376,9 +400,11 @@ class MonitorService:
                     # rest of the story.
                     since = float(recovered.get("since", 0) or 0)
                     minutes = max(1, int((float(recovered.get("at", time.time())) - since) / 60)) if since else 1
-                    self.log_event(
-                        f"{inst['name']} 查询恢复（失败 {recovered.get('streak', 1)} 次，约 {minutes} 分钟）"
-                    )
+                    if st.pop("outage_logged", False):
+                        self.log_event(
+                            f"{inst['name']} 查询恢复（失败 {recovered.get('streak', 1)} 次，"
+                            f"约 {minutes} 分钟）"
+                        )
                     for ref in st.pop("error_notify_msgs", []) or []:
                         try:
                             await app.bot.delete_message(
@@ -459,6 +485,29 @@ class MonitorService:
                             await self.send_notify(
                                 app, self.format_alert(inst, snap, "流量已超阈值，实例当前已关机")
                             )
+                        elif snap.status_error:
+                            # Traffic is over the line but the power state is
+                            # unreadable, so an automatic stop cannot be
+                            # confirmed safe. Escalate to a human instead of
+                            # silently doing nothing.
+                            self.log.warning(
+                                "%s 已超阈值但状态读取失败，未发送停机: %s",
+                                inst["name"],
+                                snap.status_error,
+                            )
+                            if not st.get("unknown_status_notified"):
+                                self.log_event(f"{inst['name']} 超阈值但状态未知，未自动关机")
+                                await self.send_notify(
+                                    app,
+                                    f"⚠️ <b>{html.escape(inst['name'])} 需要人工确认</b>\n"
+                                    f"流量已达 {snap.percent:.1f}%（{reason}），"
+                                    f"但实例状态读取失败，无法确认是否在运行，"
+                                    f"因此<b>没有</b>执行自动关机。\n"
+                                    f"<code>{html.escape(snap.status_error[:300])}</code>\n\n"
+                                    f"请到阿里云控制台确认，或在面板里手动关机。",
+                                )
+                                st["unknown_status_notified"] = True
+                            st["over_threshold_checks"] = 2  # stay armed
                         else:
                             self.log.warning(
                                 "%s 已超阈值但状态为 %s，暂不发送停机", inst["name"], snap.status
@@ -470,6 +519,11 @@ class MonitorService:
     async def monitor_loop(self, app: Application) -> None:
         await asyncio.sleep(3)
         while True:
+            # Cadence is measured from the start of each cycle, so a slow
+            # check (a failing instance can spend two minutes in retries)
+            # eats into the idle time rather than pushing every later cycle
+            # further and further behind.
+            started = time.monotonic()
             try:
                 self.sync_config()
                 snapshots = await self.check_once(app, enforce=True)
@@ -479,7 +533,26 @@ class MonitorService:
                 raise
             except Exception:
                 self.log.exception("监控循环异常")
-            await asyncio.sleep(int(self.config.monitor["interval_seconds"]))
+
+            interval = int(self.config.monitor["interval_seconds"])
+            retry_delay = int(self.config.monitor["retry_delay_seconds"])
+            # Observed failures are almost always a single wobbly minute that
+            # has cleared long before the next scheduled check. Re-querying
+            # just the failed instances shortly after turns a "5 分钟 outage"
+            # into a ~45 秒 one, and usually keeps it below the notification
+            # threshold entirely. Healthy instances are not re-queried.
+            pending = self.failing_ids()
+            if pending and time.monotonic() - started + retry_delay < interval:
+                await asyncio.sleep(retry_delay)
+                try:
+                    self.log.info("对 %d 台失败实例发起快速重试", len(pending))
+                    await self.check_once(app, enforce=True, only=pending)
+                    await self.update_panel(app)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    self.log.exception("快速重试异常")
+            await asyncio.sleep(max(1.0, interval - (time.monotonic() - started)))
 
     # -- live panel --------------------------------------------------------
 
@@ -676,9 +749,8 @@ class MonitorService:
         threshold = int(inst.get("shutdown_percent", 95))
         level = severity(snap.percent, threshold)
         tripped = bool(st.get("shutdown_triggered"))
-        lines = [
-            f"{SEV_ICON[level]} <b>{name}</b> · {html.escape(status_cn(snap.status))}"
-        ]
+        state_cn = "状态未知" if snap.status_error else status_cn(snap.status)
+        lines = [f"{SEV_ICON[level]} <b>{name}</b> · {html.escape(state_cn)}"]
         if snap.total_bytes <= 0:
             # A zero quota (mis-set quota_gb, or a SWAS instance with no
             # traffic package) makes every percentage meaningless — say so
@@ -706,6 +778,8 @@ class MonitorService:
 
         if snap.overflow_bytes > 0:
             lines.append(f"❗ 已超额 {fmt_gb(snap.overflow_bytes)}")
+        if snap.status_error:
+            lines.append("⚠️ 开关机状态读取失败，流量数据正常")
         if streak:
             lines.append(
                 f"⚠️ 查询异常 {streak} 次 · 以上为 {self.fmt_clock(snap.checked_at)} 数据"
@@ -840,7 +914,8 @@ class MonitorService:
 
         head = f"🖥 <b>{name}</b>"
         if good:
-            head += f" · {self.pct_icon(snap.percent, soft)} {html.escape(status_cn(snap.status))}"
+            state_cn = "状态未知" if snap.status_error else status_cn(snap.status)
+            head += f" · {self.pct_icon(snap.percent, soft)} {html.escape(state_cn)}"
         if not inst.get("enabled", True):
             head += " · ⏸ 已停用监控"
         lines = [head]
@@ -898,6 +973,17 @@ class MonitorService:
         )
         lines.append(self.card(guard))
 
+        if good and snap.status_error:
+            lines.append(
+                self.card(
+                    [
+                        "⚠️ <b>开关机状态读取失败</b>",
+                        f"<code>{html.escape(snap.status_error[:300])}</code>",
+                        "<i>流量数据正常；状态未知期间不会自动关机，"
+                        "超过熔断线会改为发通知提醒人工处理。</i>",
+                    ]
+                )
+            )
         if streak or (snap is not None and snap.error):
             err = str(st.get("last_error") or (snap.error if snap else "") or "")
             when = (
@@ -957,6 +1043,7 @@ class MonitorService:
                 f"🔔 分级提醒线 <b>{'/'.join(str(x) for x in m['warning_percentages'])}%</b>\n"
                 f"📅 每日汇总 <b>{html.escape(str(daily))}</b>\n"
                 f"▶️ 新账期开机确认线 <b>≤ {m['resume_below_percent']}%</b>\n"
+                f"♻️ 查询失败后 <b>{m['retry_delay_seconds']} 秒</b>快速重试\n"
                 f"🔕 连续 <b>{m['error_notify_after_failures']}</b> 次失败才提醒，恢复自动撤回"
                 "</blockquote>",
                 "<blockquote>"

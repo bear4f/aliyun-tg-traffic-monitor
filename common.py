@@ -30,8 +30,14 @@ LOG_PATH = Path(os.environ.get("ALIYUN_MONITOR_LOG", APP_DIR / "monitor.log"))
 
 SERVICE_NAME = "aliyun-traffic-bot"
 GIB = 1024 ** 3
+
+# Read-path retry policy. Four attempts covers a wobble that spans two of them,
+# while the wall-clock budget keeps a single bad instance from eating into the
+# next check cycle (default interval 300s).
+READ_ATTEMPTS = 4
+READ_BUDGET_SECONDS = 120
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,24}$")
-VERSION = "3.4.0"
+VERSION = "3.5.0"
 
 # Aliyun bills and resets the CDT free quota on Beijing time, regardless of the
 # timezone the operator picked for display. Deriving the billing month from the
@@ -69,6 +75,63 @@ class ConfigError(RuntimeError):
 
 class AliyunAPIError(RuntimeError):
     pass
+
+
+# --------------------------------------------------------------------------
+# API error classification
+# --------------------------------------------------------------------------
+
+# Substrings that mean "the network or the service wobbled" — worth retrying.
+RETRYABLE_HINTS = (
+    "timed out", "timeout", "connection", "connectionerror", "connectionreset",
+    "sslerror", "ssl:", "max retries exceeded", "temporarily", "throttl",
+    "flowlimit", "serviceunavailable", "internalerror", "servererror",
+    "bad gateway", "502", "503", "504", "request was denied due to",
+)
+
+# Substrings that mean "this will fail identically forever" — retrying only
+# delays the real error by ~15 seconds and burns quota.
+FATAL_HINTS = (
+    "invalidaccesskeyid", "signaturedoesnotmatch", "securitytoken",
+    "forbidden.ram", "noperm", "notauthorized", "unauthorized",
+    "invalidinstanceid", "instancenotfound", "invalidregion",
+    "missingparameter", "invalidparameter", "accountnotenough",
+)
+
+# Short Chinese labels so the panel and the log say what actually broke,
+# instead of a wall of urllib3 traceback text.
+ERROR_KINDS = (
+    ("read timed out", "读超时"),
+    ("connect timeout", "连接超时"),
+    ("connecttimeout", "连接超时"),
+    ("timed out", "超时"),
+    ("throttl", "被限流"),
+    ("invalidaccesskeyid", "AccessKey 无效"),
+    ("signaturedoesnotmatch", "AccessKey Secret 不匹配"),
+    ("noperm", "RAM 权限不足"),
+    ("forbidden.ram", "RAM 权限不足"),
+    ("sslerror", "TLS 握手失败"),
+    ("connection", "连接失败"),
+)
+
+
+def is_retryable(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    if any(hint in text for hint in FATAL_HINTS):
+        return False
+    if any(hint in text for hint in RETRYABLE_HINTS):
+        return True
+    # Unknown failures get one more chance rather than none: a monitor would
+    # rather spend 5 seconds than report a false outage.
+    return True
+
+
+def describe_error(exc: BaseException) -> str:
+    text = str(exc).lower()
+    for hint, label in ERROR_KINDS:
+        if hint in text:
+            return label
+    return "调用失败"
 
 
 # --------------------------------------------------------------------------
@@ -328,6 +391,7 @@ def default_config() -> Dict[str, Any]:
             "timezone": "Asia/Taipei",
             "error_notify_cooldown_seconds": 3600,
             "error_notify_after_failures": 3,
+            "retry_delay_seconds": 45,
             "resume_below_percent": 10,
             "max_concurrency": 5,
             "telegram_page_size": 6,
@@ -419,6 +483,7 @@ class ConfigStore:
             monitor["error_notify_after_failures"] = min(
                 50, max(1, int(monitor["error_notify_after_failures"]))
             )
+            monitor["retry_delay_seconds"] = min(600, max(10, int(monitor["retry_delay_seconds"])))
             # Cosmetic-only settings: fall back rather than refuse to start.
             if str(monitor.get("panel_style")) not in PANEL_STYLE_CN:
                 monitor["panel_style"] = "card"
@@ -537,6 +602,10 @@ class UsageSnapshot:
     scope_note: str = ""
     checked_at: float = 0.0
     error: str = ""
+    # Set when the traffic figures are good but the power-state read failed.
+    # The traffic number is what the breaker and the panel are actually for,
+    # so losing the status must not throw the whole reading away.
+    status_error: str = ""
 
     @property
     def percent(self) -> float:
@@ -555,6 +624,7 @@ class UsageSnapshot:
             "scope_note": self.scope_note,
             "checked_at": self.checked_at,
             "error": self.error,
+            "status_error": self.status_error,
         }
 
     @classmethod
@@ -575,6 +645,7 @@ class UsageSnapshot:
             scope_note=str(raw.get("scope_note", "")),
             checked_at=float(raw.get("checked_at", 0) or 0),
             error=str(raw.get("error", "")),
+            status_error=str(raw.get("status_error", "")),
         )
 
 
@@ -594,10 +665,19 @@ class AliyunClient:
         version: str,
         action: str,
         params: Optional[Dict[str, Any]] = None,
-        retries: int = 3,
+        retries: int = READ_ATTEMPTS,
+        alt_domains: Tuple[str, ...] = (),
     ) -> Dict[str, Any]:
         from aliyunsdkcore.request import CommonRequest
 
+        # Alternate between endpoints when one is offered: a regional endpoint
+        # having a bad minute is far more common than the whole service being
+        # down, and the central endpoint answers the same query.
+        domains = (domain, *alt_domains)
+        # Hard wall-clock cap. Attempts × (connect + read) × backoff can
+        # otherwise outrun the check interval, so a slow instance would delay
+        # every later cycle instead of just failing this one.
+        deadline = time.monotonic() + READ_BUDGET_SECONDS
         last_error: Optional[Exception] = None
         for attempt in range(retries):
             try:
@@ -605,7 +685,7 @@ class AliyunClient:
                 req.set_accept_format("json")
                 req.set_protocol_type("https")
                 req.set_method("POST")
-                req.set_domain(domain)
+                req.set_domain(domains[attempt % len(domains)])
                 req.set_version(version)
                 req.set_action_name(action)
                 # SDK timeouts are in SECONDS (passed straight through to
@@ -628,13 +708,22 @@ class AliyunClient:
                 return result
             except Exception as exc:  # the SDK raises several unrelated classes
                 last_error = exc
-                if attempt + 1 < retries:
-                    # Spread retries far enough apart to outlive a short
-                    # network wobble instead of burning all attempts inside
-                    # it; jitter keeps concurrent instances from retrying
-                    # against the endpoint in lockstep.
-                    time.sleep(3 * (2 ** attempt) + random.uniform(0, 2))
-        raise AliyunAPIError(f"{action} 调用失败: {last_error}") from last_error
+                if not is_retryable(exc):
+                    # Wrong key or missing permission fails identically every
+                    # time; retrying just delays the message the operator needs.
+                    break
+                if attempt + 1 >= retries:
+                    break
+                # Spread retries far enough apart to outlive a short network
+                # wobble instead of burning all attempts inside it; jitter keeps
+                # concurrent instances from retrying in lockstep.
+                pause = min(3 * (2 ** attempt), 20) + random.uniform(0, 2)
+                if time.monotonic() + pause >= deadline:
+                    break
+                time.sleep(pause)
+        raise AliyunAPIError(
+            f"{action} {describe_error(last_error)}: {last_error}"
+        ) from last_error
 
     def _client(self, region: Optional[str] = None):
         from aliyunsdkcore.client import AcsClient
@@ -656,6 +745,18 @@ class AliyunClient:
             return self._get_swas_snapshot()
         return self._get_ecs_cdt_snapshot()
 
+    def _tolerant_status(self) -> Tuple[str, str]:
+        """Power state, degrading to Unknown instead of failing the snapshot.
+
+        A traffic reading with an unknown power state is still worth keeping:
+        it feeds the panel, the trend history and the forecast. Throwing it
+        away because a second, unrelated API call wobbled also silently
+        disables the breaker, which is the opposite of safe."""
+        try:
+            return self.get_status(), ""
+        except Exception as exc:
+            return "Unknown", str(exc)
+
     def _get_swas_snapshot(self) -> UsageSnapshot:
         region = self.config["region"]
         instance_id = self.config["instance_id"]
@@ -673,21 +774,7 @@ class AliyunClient:
         if not item:
             raise AliyunAPIError("未在 ListInstancesTrafficPackages 返回中找到该实例")
 
-        status_data = self._common_request(
-            client,
-            domain,
-            "2020-06-01",
-            "ListInstanceStatus",
-            {
-                "RegionId": region,
-                "InstanceIds": json.dumps([instance_id]),
-                "PageNumber": 1,
-                "PageSize": 10,
-            },
-        )
-        statuses = status_data.get("InstanceStatuses", [])
-        status_item = next((x for x in statuses if x.get("InstanceId") == instance_id), None)
-        status = (status_item or {}).get("Status", "Unknown")
+        status, status_error = self._tolerant_status()
         total = int(item.get("TrafficPackageTotal", 0) or 0)
         used = int(item.get("TrafficUsed", 0) or 0)
         remaining = int(item.get("TrafficPackageRemaining", max(total - used, 0)) or 0)
@@ -703,6 +790,7 @@ class AliyunClient:
             overflow_bytes=overflow,
             scope_note="轻量应用服务器实例级出网流量包",
             checked_at=time.time(),
+            status_error=status_error,
         )
 
     def _get_ecs_cdt_snapshot(self) -> UsageSnapshot:
@@ -728,7 +816,7 @@ class AliyunClient:
             if include:
                 used += int(detail.get("Traffic", 0) or 0)
 
-        status = self.get_status()
+        status, status_error = self._tolerant_status()
         total = int(float(self.config["quota_gb"]) * GIB)
         note_map = {
             "all": "CDT 账号全部公网累计用量",
@@ -747,6 +835,7 @@ class AliyunClient:
             overflow_bytes=max(used - total, 0),
             scope_note=note_map[scope] + "（账号池口径，非实例网卡计量）",
             checked_at=time.time(),
+            status_error=status_error,
         )
 
     def get_status(self) -> str:
@@ -781,6 +870,9 @@ class AliyunClient:
             "2014-05-26",
             "DescribeInstances",
             {"RegionId": region, "InstanceIds": json.dumps([instance_id])},
+            # The central endpoint serves the same RegionId-scoped query, so a
+            # single flaky regional endpoint no longer costs a whole cycle.
+            alt_domains=("ecs.aliyuncs.com",),
         )
         instances = data.get("Instances", {}).get("Instance", [])
         if not instances:
