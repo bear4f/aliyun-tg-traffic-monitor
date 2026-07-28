@@ -43,6 +43,9 @@ from common import (
     ConfigStore,
     StateStore,
     UsageSnapshot,
+    BAR_STYLE_CN,
+    BAR_STYLES,
+    PANEL_STYLE_CN,
     billing_now,
     burn_forecast,
     fmt_gb,
@@ -543,12 +546,19 @@ class MonitorService:
     def format_alert(self, inst: Dict[str, Any], snap: UsageSnapshot, action: str) -> str:
         return (
             f"🚨 <b>{html.escape(inst['name'])}</b>\n"
-            f"<blockquote><code>{self.meter(snap.percent)}</code>\n"
-            f"{fmt_gb(snap.used_bytes, unit=False)} / {fmt_gb(snap.total_bytes)} · "
-            f"余 {fmt_gb(snap.remaining_bytes)}\n"
-            f"状态 {html.escape(status_cn(snap.status))}\n"
-            f"动作 <b>{html.escape(action)}</b></blockquote>\n"
-            f"<i>{html.escape(snap.scope_note)}</i>"
+            + self.card(
+                [
+                    self.meter(
+                        snap.percent,
+                        severity(snap.percent, int(inst.get("shutdown_percent", 95))),
+                    ),
+                    f"{fmt_gb(snap.used_bytes, unit=False)} / {fmt_gb(snap.total_bytes)} · "
+                    f"余 {fmt_gb(snap.remaining_bytes)}",
+                    f"状态 {html.escape(status_cn(snap.status))}",
+                    f"动作 <b>{html.escape(action)}</b>",
+                ]
+            )
+            + f"\n<i>{html.escape(snap.scope_note)}</i>"
         )
 
     def forecast(self, inst: Dict[str, Any], snap: UsageSnapshot) -> Dict[str, Any]:
@@ -613,11 +623,28 @@ class MonitorService:
     def pct_icon(self, percent: float, shutdown_percent: int) -> str:
         return SEV_ICON[severity(percent, shutdown_percent)]
 
-    @staticmethod
-    def meter(percent: float, width: int = BAR_WIDTH) -> str:
-        """Bar plus right-aligned percentage, sized so every card's meter lines
-        up under the next — the whole point of putting it in a <code> run."""
-        return f"{progress_bar(percent, width, 'bars')} {percent:5.1f}%"
+    def meter(self, percent: float, level: str = "ok", width: int = BAR_WIDTH) -> str:
+        """Bar plus percentage, as an HTML fragment.
+
+        The bar is a fixed number of cells, so the percentage starts at the
+        same column on every card without padding the number itself — padding
+        it looked like a stray gap whenever nothing was over 100%."""
+        style = str(self.config.monitor.get("bar_style", "bars"))
+        bar = progress_bar(percent, width, style, level)
+        if style == "squares":
+            # Emoji in a monospace run get letter-spaced by some clients.
+            return f"{bar} <b>{percent:.1f}%</b>"
+        return f"<code>{bar}</code> <b>{percent:.1f}%</b>"
+
+    def card(self, lines: List[str]) -> str:
+        """Wrap one machine card according to the chosen layout. Telegram's
+        blockquote gives a tinted panel with a quote glyph on some clients,
+        which reads as 'someone said this' rather than 'this is a card' — the
+        flat layout drops it for anyone who prefers plainer output."""
+        body = "\n".join(lines)
+        if str(self.config.monitor.get("panel_style", "card")) == "flat":
+            return body
+        return f"<blockquote>{body}</blockquote>"
 
     @staticmethod
     def hard_percent(inst: Dict[str, Any]) -> int:
@@ -643,14 +670,14 @@ class MonitorService:
                 head = f"🔴 <b>{name}</b> · 查询失败"
                 if streak:
                     head += f"（{streak} 次 · {self.fmt_clock(float(st.get('last_error_at', 0)))}）"
-                return f"<blockquote>{head}\n<code>{html.escape(err[:140])}</code></blockquote>"
-            return f"<blockquote>⚪ <b>{name}</b> · 尚未查询\n<i>点下方「刷新全部」开始</i></blockquote>"
+                return self.card([head, f"<code>{html.escape(err[:140])}</code>"])
+            return self.card([f"⚪ <b>{name}</b> · 尚未查询", "<i>点下方「刷新全部」开始</i>"])
 
         threshold = int(inst.get("shutdown_percent", 95))
+        level = severity(snap.percent, threshold)
         tripped = bool(st.get("shutdown_triggered"))
         lines = [
-            f"{self.pct_icon(snap.percent, threshold)} <b>{name}</b> · "
-            f"{html.escape(status_cn(snap.status))}"
+            f"{SEV_ICON[level]} <b>{name}</b> · {html.escape(status_cn(snap.status))}"
         ]
         if snap.total_bytes <= 0:
             # A zero quota (mis-set quota_gb, or a SWAS instance with no
@@ -662,7 +689,7 @@ class MonitorService:
             ]
         else:
             lines += [
-                f"<code>{self.meter(snap.percent)}</code>",
+                self.meter(snap.percent, level),
                 f"{fmt_gb(snap.used_bytes, unit=False)} / {fmt_gb(snap.total_bytes)} · "
                 f"余 {fmt_gb(snap.remaining_bytes)}",
             ]
@@ -683,7 +710,7 @@ class MonitorService:
             lines.append(
                 f"⚠️ 查询异常 {streak} 次 · 以上为 {self.fmt_clock(snap.checked_at)} 数据"
             )
-        return "<blockquote>" + "\n".join(lines) + "</blockquote>"
+        return self.card(lines)
 
     def page_instances(self, page: int) -> Tuple[int, int, List[Dict[str, Any]]]:
         enabled = self.enabled_instances()
@@ -718,9 +745,20 @@ class MonitorService:
             pools += 1
         if pools < 2 or total <= 0:
             return ""
+        percent = used / total * 100
+        # Reuse the worst per-machine severity so the roll-up meter cannot look
+        # calm while one machine is already at its breaker.
+        worst = "ok"
+        for inst in self.enabled_instances():
+            snap = self.last_snapshots.get(inst["id"])
+            if snap is None or snap.total_bytes <= 0:
+                continue
+            level = severity(snap.percent, int(inst.get("shutdown_percent", 95)))
+            if level == "crit" or (level == "warn" and worst == "ok"):
+                worst = level
         return (
-            f"合计 {fmt_gb(used, 1, unit=False)} / {fmt_gb(total, 0)} · "
-            f"{used / total * 100:.1f}%"
+            f"{self.meter(percent, worst)} · "
+            f"{fmt_gb(used, 1, unit=False)} / {fmt_gb(total, 0)}"
         )
 
     def freshness(self) -> str:
@@ -810,15 +848,14 @@ class MonitorService:
             lines.append(notice)
 
         if good and snap.total_bytes > 0:
-            lines += [
-                "",
-                "<blockquote>"
-                f"<code>{self.meter(snap.percent, DETAIL_BAR_WIDTH)}</code>\n"
-                f"已用 <b>{fmt_gb(snap.used_bytes)}</b> / {fmt_gb(snap.total_bytes)}\n"
-                f"剩余 <b>{fmt_gb(snap.remaining_bytes)}</b>"
-                + (f"\n❗ 已超额 <b>{fmt_gb(snap.overflow_bytes)}</b>" if snap.overflow_bytes > 0 else "")
-                + "</blockquote>",
+            usage = [
+                self.meter(snap.percent, severity(snap.percent, soft), DETAIL_BAR_WIDTH),
+                f"已用 <b>{fmt_gb(snap.used_bytes)}</b> / {fmt_gb(snap.total_bytes)}",
+                f"剩余 <b>{fmt_gb(snap.remaining_bytes)}</b>",
             ]
+            if snap.overflow_bytes > 0:
+                usage.append(f"❗ 已超额 <b>{fmt_gb(snap.overflow_bytes)}</b>")
+            lines += ["", self.card(usage)]
         elif good:
             lines += ["", f"已用 <b>{fmt_gb(snap.used_bytes)}</b>", "⚠️ 额度读数为 0，无法计算百分比"]
 
@@ -843,7 +880,7 @@ class MonitorService:
                     risk = "✅ 无触线风险"
                 forecast_lines.append(f"🔮 月底约 {fmt_gb(f['end_bytes'], 0)} · {risk}")
             if forecast_lines:
-                lines.append("<blockquote>" + "\n".join(forecast_lines) + "</blockquote>")
+                lines.append(self.card(forecast_lines))
 
         guard = [
             f"🛡 熔断 {soft}% {'开' if inst.get('auto_shutdown', True) else '关'}"
@@ -859,7 +896,7 @@ class MonitorService:
             f"🗓 次月开机 {'开' if inst.get('auto_start_next_month') else '关'} · "
             f"🎛 手动控制 {'开' if inst.get('allow_manual_control', True) else '关'}"
         )
-        lines.append("<blockquote>" + "\n".join(guard) + "</blockquote>")
+        lines.append(self.card(guard))
 
         if streak or (snap is not None and snap.error):
             err = str(st.get("last_error") or (snap.error if snap else "") or "")
@@ -871,7 +908,7 @@ class MonitorService:
             fail = [f"⚠️ <b>查询失败中</b>{when}", f"<code>{html.escape(err[:400])}</code>"]
             if good:
                 fail.append("<i>上方用量为最后一次成功查询的数据。</i>")
-            lines.append("<blockquote>" + "\n".join(fail) + "</blockquote>")
+            lines.append(self.card(fail))
         elif snap is None:
             lines.append("<i>尚未查询，点击「🔄 刷新」</i>")
 
@@ -923,6 +960,8 @@ class MonitorService:
                 f"🔕 连续 <b>{m['error_notify_after_failures']}</b> 次失败才提醒，恢复自动撤回"
                 "</blockquote>",
                 "<blockquote>"
+                f"🎨 面板布局 <b>{PANEL_STYLE_CN[str(m['panel_style'])]}</b> · "
+                f"进度条 <b>{BAR_STYLE_CN[str(m['bar_style'])]}</b>\n"
                 f"🌏 显示时区 <code>{html.escape(str(m['timezone']))}</code>\n"
                 f"🧾 账期时区 <code>Asia/Shanghai</code>（阿里云计费）\n"
                 f"⚡ 并发查询 <b>{m['max_concurrency']}</b> · 每页 <b>{m['telegram_page_size']}</b> 台"
@@ -1148,6 +1187,16 @@ class MonitorService:
                 [
                     InlineKeyboardButton("✏️ 提醒线", callback_data="G:warning_percentages"),
                     InlineKeyboardButton("✏️ 汇总时间", callback_data="G:daily_report_time"),
+                ],
+                # Cycling in place beats a submenu here: the effect is only
+                # visible on the home panel, so you flip and go look.
+                [
+                    InlineKeyboardButton(
+                        f"🎨 {PANEL_STYLE_CN[str(m['panel_style'])]}", callback_data="s:panel_style"
+                    ),
+                    InlineKeyboardButton(
+                        f"{BAR_STYLE_CN[str(m['bar_style'])]}", callback_data="s:bar_style"
+                    ),
                 ],
                 [InlineKeyboardButton("👥 管理员", callback_data="n:a")],
                 [InlineKeyboardButton(HOME, callback_data="n:h:0")],
@@ -1553,6 +1602,23 @@ async def dispatch_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if head == "G":
         await query.answer()
         await prompt_input(service, query, context, parts[1])
+        return
+
+    # -- appearance --------------------------------------------------------
+    if head == "s":
+        field = parts[1]
+        options = {"panel_style": list(PANEL_STYLE_CN), "bar_style": list(BAR_STYLES)}
+        if field not in options:
+            await query.answer()
+            return
+        choices = options[field]
+        current = str(service.config.monitor.get(field, choices[0]))
+        index = choices.index(current) if current in choices else 0
+        service.config.monitor[field] = choices[(index + 1) % len(choices)]
+        service.config.save()
+        labels = PANEL_STYLE_CN if field == "panel_style" else BAR_STYLE_CN
+        await query.answer(f"已切换为 {labels[service.config.monitor[field]]}")
+        await safe_edit(query, service.global_text(), service.global_keyboard())
         return
 
     # -- admins ------------------------------------------------------------

@@ -31,7 +31,7 @@ LOG_PATH = Path(os.environ.get("ALIYUN_MONITOR_LOG", APP_DIR / "monitor.log"))
 SERVICE_NAME = "aliyun-traffic-bot"
 GIB = 1024 ** 3
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,24}$")
-VERSION = "3.3.0"
+VERSION = "3.4.0"
 
 # Aliyun bills and resets the CDT free quota on Beijing time, regardless of the
 # timezone the operator picked for display. Deriving the billing month from the
@@ -132,18 +132,45 @@ def fmt_gb(value: int | float, digits: int = 2, unit: bool = True) -> str:
     return f"{gib(value):.{digits}f}" + (" GB" if unit else "")
 
 
-# Terminal fonts render the block elements crisply; Telegram's monospace font
-# makes the same pair look heavy and noisy, where the geometric bars read as a
-# proper meter. Same widths in both sets, so the meters still line up.
+# How a meter actually looks depends on the font the client picked, which no
+# amount of care here can predict: the same characters are crisp in a terminal,
+# thin on iOS Telegram and different again on desktop. So the set is a
+# preference the operator flips until it looks right on their own phone.
 BAR_STYLES = {
     "blocks": ("█", "░"),
     "bars": ("▰", "▱"),
+    "line": ("━", "─"),
+    "squares": ("🟩", "⬜"),  # filled glyph is replaced per severity below
 }
 
+BAR_STYLE_CN = {
+    "blocks": "█░ 实心",
+    "bars": "▰▱ 细条",
+    "line": "━─ 细线",
+    "squares": "🟩 彩块",
+}
 
-def progress_bar(percent: float, width: int = 12, style: str = "blocks") -> str:
+# The colour-square meter carries severity in the bar itself, so the fill turns
+# yellow then red as usage climbs.
+SQUARE_FILL = {"ok": "🟩", "warn": "🟨", "crit": "🟥"}
+
+# Emoji render roughly twice as wide as a block character, so the square meter
+# needs fewer cells to occupy the same line width.
+BAR_WIDTHS = {"squares": 7}
+
+PANEL_STYLE_CN = {"card": "卡片式", "flat": "平铺式"}
+
+
+def bar_width(style: str, width: int) -> int:
+    return BAR_WIDTHS.get(style, width)
+
+
+def progress_bar(percent: float, width: int = 12, style: str = "blocks", level: str = "ok") -> str:
     """Unicode meter that stays readable in both Telegram and a terminal."""
     filled_char, empty_char = BAR_STYLES.get(style, BAR_STYLES["blocks"])
+    if style == "squares":
+        filled_char = SQUARE_FILL.get(level, SQUARE_FILL["ok"])
+    width = bar_width(style, width)
     ratio = max(0.0, min(1.0, percent / 100.0))
     filled = int(round(ratio * width))
     # Never show a completely empty bar for non-zero usage, and never show a
@@ -304,6 +331,8 @@ def default_config() -> Dict[str, Any]:
             "resume_below_percent": 10,
             "max_concurrency": 5,
             "telegram_page_size": 6,
+            "panel_style": "card",
+            "bar_style": "bars",
         },
         "instances": [],
     }
@@ -390,6 +419,11 @@ class ConfigStore:
             monitor["error_notify_after_failures"] = min(
                 50, max(1, int(monitor["error_notify_after_failures"]))
             )
+            # Cosmetic-only settings: fall back rather than refuse to start.
+            if str(monitor.get("panel_style")) not in PANEL_STYLE_CN:
+                monitor["panel_style"] = "card"
+            if str(monitor.get("bar_style")) not in BAR_STYLES:
+                monitor["bar_style"] = "bars"
             ZoneInfo(str(monitor["timezone"]))
         except Exception as exc:
             raise ConfigError(f"monitor 配置无效: {exc}") from exc
