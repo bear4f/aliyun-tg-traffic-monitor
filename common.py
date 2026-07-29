@@ -37,7 +37,7 @@ GIB = 1024 ** 3
 READ_ATTEMPTS = 4
 READ_BUDGET_SECONDS = 120
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,24}$")
-VERSION = "3.5.0"
+VERSION = "3.6.0"
 
 # Aliyun bills and resets the CDT free quota on Beijing time, regardless of the
 # timezone the operator picked for display. Deriving the billing month from the
@@ -289,12 +289,26 @@ def month_reset_info(now: datetime) -> Tuple[datetime, int]:
     return nxt, max(0, (nxt - now).days)
 
 
+# A monthly quota reset drops usage to near zero, so the new value lands below
+# where the current run *started*. A reading that spikes and then corrects back
+# lands above it — that distinction is what tells the two apart, since both look
+# like a big drop from the previous sample.
+RESET_DROP_RATIO = 0.5
+
+
 def rolling_rate(
     samples: List[Dict[str, Any]], now_ts: float, window_seconds: float
 ) -> Optional[float]:
     """Average usage growth in bytes/day over the trailing window, computed
-    from periodic {t, u} samples. Month resets (usage dropping) contribute
-    zero rather than negative growth. Returns None when the window holds too
+    from periodic {t, u} samples.
+
+    Growth is measured between segment endpoints rather than by summing every
+    hop. Summing hops counts an inflated reading in full but credits nothing
+    back when the next sample corrects it, so one bad reading used to inflate
+    the rate for the rest of the window — always upward, never down.
+
+    A quota reset (usage collapsing toward zero) starts a new segment instead
+    of counting as negative growth. Returns None when the window holds too
     little history for an honest estimate."""
     pts = [s for s in samples if float(s.get("t", 0)) >= now_ts - window_seconds]
     if len(pts) < 2:
@@ -302,10 +316,19 @@ def rolling_rate(
     span = float(pts[-1]["t"]) - float(pts[0]["t"])
     if span < window_seconds * 0.4:
         return None
-    total = 0.0
-    for prev, cur in zip(pts, pts[1:]):
-        total += max(0.0, float(cur.get("u", 0)) - float(prev.get("u", 0)))
-    return total / span * 86400.0
+    growth = 0.0
+    segment_start = previous = float(pts[0].get("u", 0) or 0)
+    for point in pts[1:]:
+        current = float(point.get("u", 0) or 0)
+        # Both tests must hold: a steep drop (not a rounding wobble) that also
+        # undercuts the start of the current run (so it is a new cycle, not a
+        # bad reading falling back to trend).
+        if current < previous * RESET_DROP_RATIO and current < segment_start:
+            growth += max(0.0, previous - segment_start)
+            segment_start = current
+        previous = current
+    growth += max(0.0, previous - segment_start)
+    return growth / span * 86400.0
 
 
 def burn_forecast(

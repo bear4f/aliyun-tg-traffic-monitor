@@ -637,7 +637,13 @@ class MonitorService:
     def forecast(self, inst: Dict[str, Any], snap: UsageSnapshot) -> Dict[str, Any]:
         """Burn-rate forecast from rolling 24h/7d rates over the sampled
         history, falling back to the month-to-date average when history is
-        thin. rate = max(24h, 7d) so a sudden surge shows up quickly."""
+        thin. rate = max(24h, 7d) so a sudden surge shows up quickly.
+
+        Because of that max(), the headline rate is deliberately the *fastest*
+        recent pace, not a month average — a machine that has used little this
+        month but sped up yesterday will show a high rate, which is the point.
+        `window` says which measurement won so the panel can label it honestly
+        instead of calling all of them '日均'."""
         soft = int(inst.get("shutdown_percent", 95))
         # Billing time, not display time: the elapsed-days and days-to-reset
         # maths must line up with when Aliyun actually rolls the quota over.
@@ -646,10 +652,15 @@ class MonitorService:
         hist = self.state.instance(inst["id"]).get("usage_history") or []
         rate24 = rolling_rate(hist, now_ts, 86400)
         rate7 = rolling_rate(hist, now_ts, 7 * 86400)
-        rate = max((r for r in (rate24, rate7) if r is not None), default=None)
-        if rate is None:
-            daily, _ = burn_forecast(snap.used_bytes, snap.total_bytes, soft, now)
-            rate = daily if daily > 0 else None
+        month_rate, _ = burn_forecast(snap.used_bytes, snap.total_bytes, soft, now)
+        month_rate = month_rate if month_rate > 0 else None
+
+        window = "month"
+        candidates = [(r, w) for r, w in ((rate24, "24h"), (rate7, "7d")) if r is not None]
+        if candidates:
+            rate, window = max(candidates)
+        else:
+            rate = month_rate
 
         reset_at, _ = month_reset_info(now)
         days_to_reset = max(0.0, (reset_at - now).total_seconds() / 86400)
@@ -666,10 +677,15 @@ class MonitorService:
             "rate": rate,
             "rate24": rate24,
             "rate7": rate7,
+            "month_rate": month_rate,
+            "window": window,
+            "elapsed_days": (now.day - 1) + now.hour / 24 + now.minute / 1440,
             "end_bytes": end_bytes,
             "hit_at": hit_at,
             "reached": reached,
         }
+
+    RATE_WINDOW_CN = {"24h": "近 24 小时", "7d": "近 7 天", "month": "本月累计"}
 
     def pace_lines(
         self, inst: Dict[str, Any], snap: UsageSnapshot, risk: bool = True
@@ -681,7 +697,9 @@ class MonitorService:
         f = self.forecast(inst, snap)
         if not f["rate"]:
             return []
-        pace = f"📈 日均 {fmt_gb(f['rate'], 1, unit=False)} GB"
+        # Name the window. "日均 4.8 GB" on a machine that has used 48 GB in 28
+        # days reads as a bug; "近 24 小时 4.8 GB/日" reads as what it is.
+        pace = f"📈 {self.RATE_WINDOW_CN[f['window']]} {fmt_gb(f['rate'], 1, unit=False)} GB/日"
         if f["end_bytes"] is not None:
             pace += f" · 月底约 {fmt_gb(f['end_bytes'], 0, unit=False)} GB"
         lines = [pace]
@@ -936,16 +954,21 @@ class MonitorService:
 
         if good:
             f = self.forecast(inst, snap)
-            trend: List[str] = []
-            if f["rate24"] is not None:
-                trend.append(f"24h {fmt_gb(f['rate24'], 1, unit=False)} GB/日")
-            if f["rate7"] is not None:
-                trend.append(f"7d {fmt_gb(f['rate7'], 1, unit=False)} GB/日")
+            # All three rates, always, with the one driving the forecast
+            # marked. Showing a single number invites "why is the machine that
+            # used less showing a bigger average?" — because it is not an
+            # average of the month, it is how fast it is going right now.
             forecast_lines: List[str] = []
-            if trend:
-                forecast_lines.append("📈 " + " · ".join(trend))
-            elif f["rate"]:
-                forecast_lines.append(f"📈 本月日均 {fmt_gb(f['rate'], 1, unit=False)} GB")
+            for key, window in (("rate24", "24h"), ("rate7", "7d"), ("month_rate", "month")):
+                value = f[key]
+                if value is None:
+                    continue
+                row = f"{self.RATE_WINDOW_CN[window]} <b>{fmt_gb(value, 1, unit=False)}</b> GB/日"
+                if window == "month":
+                    row += f"（{fmt_gb(snap.used_bytes, 1)} ÷ {f['elapsed_days']:.1f} 天）"
+                if window == f["window"]:
+                    row += " ← 用于预测"
+                forecast_lines.append("📈 " + row)
             if f["end_bytes"] is not None:
                 if f["reached"]:
                     risk = "🛑 已达熔断线"
@@ -1329,6 +1352,13 @@ class MonitorService:
                 "<blockquote>ECS/CDT 读取的是<b>整个阿里云账号</b>的 CDT 流量池，"
                 "不是单块网卡。一个账号只跑一台主力机时最准确。\n"
                 "账期按阿里云计费时区（Asia/Shanghai）翻月。</blockquote>",
+                "<b>速度与预测</b>",
+                "<blockquote>卡片上的速度是<b>最近的跑量速度</b>，取「近 24 小时」与"
+                "「近 7 天」中<b>较大</b>的一个——突然开始跑量要立刻反映出来，"
+                "所以宁可偏高。\n"
+                "它<b>不是</b>本月累计平均值。本月用得少但昨天开始猛跑的机器，"
+                "这个数就会明显高于「累计 ÷ 天数」，属于正常。\n"
+                "三个口径都在机器详情页里，可以直接对比。</blockquote>",
                 "<b>熔断规则</b>",
                 "<blockquote>• 流量查询失败时<b>绝不</b>自动关机\n"
                 "• 普通熔断线需连续 2 次确认，紧急线单次即关\n"
